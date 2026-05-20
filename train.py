@@ -15,6 +15,7 @@ from config import (
     EPOCHS,
     LEARNING_RATE,
     MODEL_PATH,
+    MODELS_DIR,
     RANDOM_STATE,
     STFT_FREQ_BINS,
     STFT_NOVERLAP,
@@ -99,7 +100,7 @@ def train_model(
             X_vib_train, X_op_train, y_train, aug_prob=AUGMENTATION_PROB
         )
 
-        # RUL log scaling 적용
+        # RUL log scaling 다시 적용 (원본 스케일이 너무 커서 학습 불가)
         y_train = np.log1p(y_train)
         y_val = np.log1p(y_val)
 
@@ -128,12 +129,36 @@ def train_model(
             operation_features=X_op.shape[-1],
             vibration_features=X_vib.shape[3],
         ).to(device)
+
+        # ── 사전학습 가중치 로드 (Transfer Learning) ─────────────────────
+        pretrained_path = MODELS_DIR / "RUL_pretrained.pt"
+        if pretrained_path.exists():
+            print(f"[Transfer] Loading pre-trained weights from {pretrained_path.name}...")
+            pretrained_state = torch.load(pretrained_path, map_location=device)
+            model_state = model.state_dict()
+            # shape이 일치하는 레이어만 로드 (채널 수 불일치 레이어는 건너뜀)
+            matched, skipped = 0, 0
+            for k, v in pretrained_state.items():
+                if k in model_state and model_state[k].shape == v.shape:
+                    model_state[k] = v
+                    matched += 1
+                else:
+                    skipped += 1
+            model.load_state_dict(model_state)
+            print(f"[Transfer] Matched={matched} layers loaded | Skipped={skipped} layers (shape mismatch)")
+        else:
+            print("[Transfer] No pre-trained weights found. Training from scratch.")
+        # ─────────────────────────────────────────────────────────────────
+
         criterion = CombinedLoss()
-        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=WEIGHT_DECAY)
+        # 전이학습 시 Fine-tuning을 위해 학습률을 더 낮게 설정
+        ft_lr = learning_rate * 0.5 if pretrained_path.exists() else learning_rate
+        optimizer = torch.optim.AdamW(model.parameters(), lr=ft_lr, weight_decay=WEIGHT_DECAY)
         # 스케줄러를 CosineAnnealingWarmRestarts로 교체하여 수렴 속도 및 성능 향상
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
 
         print(f"Device: {device} | Train: {len(train_idx)} | Val: {len(val_idx)}")
+
 
         for epoch in range(1, epochs + 1):
             model.train()
