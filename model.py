@@ -38,6 +38,26 @@ class SEBlock1D(nn.Module):
         return x * y.expand_as(x)
 
 
+class PositionalEncoding(nn.Module):
+    """
+    Temporal Attention을 위해 LSTM 출력에 위치 정보(Time-step)를 더해줍니다.
+    """
+    def __init__(self, d_model: int, max_len: int = 500):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x shape: (batch_size, seq_len, d_model)
+        """
+        return x + self.pe[:, :x.size(1), :]
+
+
 
 class STFTCNNLSTMRULModel(nn.Module):
     """
@@ -98,6 +118,8 @@ class STFTCNNLSTMRULModel(nn.Module):
             bidirectional=True,
         )
 
+        self.pos_encoder = PositionalEncoding(d_model=vib_hidden * 2)
+
         self.temporal_attention = nn.Sequential(
             nn.Linear(vib_hidden * 2, 64),
             nn.Tanh(),
@@ -132,8 +154,11 @@ class STFTCNNLSTMRULModel(nn.Module):
         vib = vib.reshape(batch_size, seq_len, 128)
         vib_out, _ = self.vibration_lstm(vib)
         
-        # Temporal Attention Pooling
-        attn_scores = self.temporal_attention(vib_out)
+        # Positional Encoding 적용
+        vib_out_pe = self.pos_encoder(vib_out)
+        
+        # Temporal Attention Pooling (Positional Encoding이 적용된 출력을 기반으로 Attention)
+        attn_scores = self.temporal_attention(vib_out_pe)
         attn_weights = torch.softmax(attn_scores, dim=1)
         
         # GPU memory leak 방지를 위해 detach.cpu()로 저장하여 시각화 모듈에서 꺼내 쓸 수 있도록 함
@@ -162,17 +187,22 @@ class AsymmetricRULLoss(nn.Module):
         self.over_scale = over_scale
         self.under_scale = under_scale
 
-    def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        targets = targets.view_as(predictions)
-        error = predictions - targets  # positive: overestimation
+    def forward(self, predictions_real: torch.Tensor, targets_real: torch.Tensor) -> torch.Tensor:
+        targets_real = targets_real.view_as(predictions_real)
+        denominator = torch.clamp(targets_real, min=1e-6)
         
-        # Asymmetric penalty
-        penalty = torch.where(
-            error > 0,
-            torch.exp(error / self.over_scale) - 1,  # overestimation penalty
-            torch.exp(-error / self.under_scale) - 1,  # underestimation penalty
+        # 백분율 오차(Percentage Error) 계산: 100 * (실제 - 예측) / 실제
+        er = 100.0 * (targets_real - predictions_real) / denominator
+        
+        # A_RUL 점수 공식의 지수(Exponent)에 음수를 취한 값 (-exponent)
+        # 이 식은 완벽한 L1 백분율 오차 형태로 작동하며, 기울기 소실(Vanishing Gradient)이 발생하지 않습니다.
+        ln_two = 0.69314718
+        loss = torch.where(
+            er <= 0,
+            ln_two * (-er) / self.over_scale,  # 과대평가 패널티
+            ln_two * er / self.under_scale,   # 과소평가 패널티
         )
-        return penalty.mean()
+        return loss.mean()
 
 
 class CombinedLoss(nn.Module):
@@ -188,8 +218,17 @@ class CombinedLoss(nn.Module):
         self.asymmetric_weight = asymmetric_weight
 
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Huber Loss는 학습 안정성을 위해 로그 스케일에서 계산 (MSLE와 유사)
         huber_loss = self.huber(predictions, targets)
-        asymmetric_loss = self.asymmetric(predictions, targets)
+        
+        # 수치 폭발 방지를 위해 로그 스케일 출력을 안전하게 클리핑 (max RUL ~35000 -> log1p ~10.46)
+        predictions_clamped = torch.clamp(predictions, max=11.5)
+        
+        # Asymmetric Loss는 평가 지표와 동일하게 진짜 스케일(Real Space)의 백분율 오차로 계산
+        pred_real = torch.expm1(predictions_clamped)
+        target_real = torch.expm1(targets)
+        asymmetric_loss = self.asymmetric(pred_real, target_real)
+        
         return self.huber_weight * huber_loss + self.asymmetric_weight * asymmetric_loss  #로스 함수 
 
 
