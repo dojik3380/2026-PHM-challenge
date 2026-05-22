@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 from nptdms import TdmsFile
 
-file_path = r"C:\Users\kdj33\OneDrive\바탕 화면\PHM\data\Train\Train1_Vibration\Train1_Vibration\000126.tdms"
+file_path = r"C:\Users\kdj33\OneDrive\바탕 화면\PHM\data\Train\Train4_Vibration\Train4_Vibration\000001.tdms"
 
 tdms = TdmsFile.read(file_path)
 

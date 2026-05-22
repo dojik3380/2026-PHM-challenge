@@ -86,7 +86,7 @@ def plot_degradation_spectrum_evolution(healthy_spec, mid_spec, failure_spec, fr
         plt.savefig(save_path, bbox_inches='tight')
     plt.close('all')
 
-def plot_spectrogram(spectrogram, freqs, times, save_path=None):
+def plot_spectrogram(spectrogram, freqs, times, rpm_trajectory=None, base_fault_freqs=None, save_path=None):
     plt.figure(figsize=(14, 6))
     # spectrogram shape: (len(freqs), len(times)) expected
     if spectrogram.shape[0] != len(freqs):
@@ -98,6 +98,21 @@ def plot_spectrogram(spectrogram, freqs, times, save_path=None):
     plt.xlabel("Time [Index]")
     plt.colorbar(label='Magnitude')
     
+    # RPM trajectory 기반 Moving Harmonics 오버레이
+    if rpm_trajectory is not None and base_fault_freqs is not None:
+        colors = ['r', 'g', 'orange', 'm']
+        for idx, (fault_name, base_freq) in enumerate(base_fault_freqs.items()):
+            c = colors[idx % len(colors)]
+            # time 단위가 index라면 rpm_trajectory와 길이가 같음
+            fault_freq_curve = base_freq * (rpm_trajectory / 1000.0)
+            
+            # 1x, 2x, 3x harmonics
+            for h in range(1, 4):
+                alpha = max(0.4, 1.0 - (h - 1) * 0.3)
+                label = f"{fault_name} ({h}x)" if h == 1 else None
+                plt.plot(times, fault_freq_curve * h, color=c, linestyle='--', alpha=alpha, label=label, linewidth=1.5)
+        plt.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
+
     if save_path:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(save_path, bbox_inches='tight')

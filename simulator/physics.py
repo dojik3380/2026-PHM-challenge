@@ -203,13 +203,11 @@ def make_background_vibration(
         bg += amp * np.sin(2 * np.pi * harmonic * rotation_freq * t + phase).astype(np.float32)
 
     # 유색 노이즈(Colored Noise): 낮은 주파수를 강조하여 실제 기계 진동 모사
-    white = rng.standard_normal(signal_length).astype(np.float32) * noise_std
-    # 단순 저역 통과 효과: 이웃 평균 (α)
-    colored = np.zeros_like(white)
+    from scipy.signal import lfilter
     alpha = 0.3
-    colored[0] = white[0]
-    for i in range(1, signal_length):
-        colored[i] = alpha * white[i] + (1.0 - alpha) * colored[i - 1]
+    white = rng.standard_normal(signal_length).astype(np.float32) * noise_std
+    # y[i] = alpha*x[i] + (1-alpha)*y[i-1]  →  IIR: b=[alpha], a=[1, -(1-alpha)]
+    colored = lfilter([alpha], [1.0, -(1.0 - alpha)], white).astype(np.float32)
 
     bg += colored
     return bg
@@ -253,3 +251,11 @@ def get_fault_freq_for_rpm(fault_type: str, rpm: float) -> float:
     if fault_type not in base_freqs:
         raise ValueError(f"Unknown fault type: {fault_type}. Choose from {list(base_freqs.keys())}")
     return base_freqs[fault_type] * (rpm / base_rpm)
+
+def get_all_fault_freqs_for_rpm(rpm: float) -> dict[str, float]:
+    """
+    기준 RPM(1000)에서의 결함 주파수를 실제 RPM에 맞게 스케일링하여 모두 반환.
+    """
+    base_rpm = 1000.0
+    base_freqs = BEARING_SPECS["fault_frequencies"]
+    return {k: v * (rpm / base_rpm) for k, v in base_freqs.items()}

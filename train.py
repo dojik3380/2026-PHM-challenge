@@ -12,11 +12,13 @@ from torch.utils.data import DataLoader, TensorDataset
 from config import (
     BATCH_SIZE,
     DEVICE,
+    EARLY_STOPPING_PATIENCE,
     EPOCHS,
     LEARNING_RATE,
     MODEL_PATH,
     MODELS_DIR,
     RANDOM_STATE,
+    SCHEDULER_T0,
     STFT_FREQ_BINS,
     STFT_NOVERLAP,
     STFT_NPERSEG,
@@ -27,7 +29,7 @@ from config import (
     WINDOW_SIZE,
     AUGMENTATION_PROB,
 )
-from data_loader import load_dataset, operation_feature_names
+from data_loader import load_dataset
 from model import AsymmetricRULLoss, CombinedLoss, create_model
 
 
@@ -37,7 +39,6 @@ def _standardize_temporal_array(
 ) -> Tuple[np.ndarray, np.ndarray, torch.Tensor, torch.Tensor]:
     """
     batch와 sequence 축을 합쳐 표준화한다.
-    진동은 (4, freq_bins), 운전은 (features,) 단위로 평균/표준편차를 가진다.
     """
     feature_shape = train_array.shape[2:]
     train_flat = train_array.reshape(-1, *feature_shape)
@@ -67,7 +68,7 @@ def train_model(
     max_samples: Optional[int] = None,
 ) -> Path:
     """Case-level split, DataLoader, AdamW, 비대칭 RUL loss로 학습한다."""
-    X_vib, X_op, y, metadata = load_dataset(
+    X_vib, X_aux, y, metadata = load_dataset(
         root_dir=data_dir,
         window_size=window_size,
         stride=stride,
@@ -90,14 +91,14 @@ def train_model(
     for fold, (train_idx, val_idx) in enumerate(gkf.split(X=np.arange(len(y)), y=None, groups=groups)):
         print(f"\n========== Fold {fold+1}/{n_splits} ==========")
         X_vib_train, X_vib_val, vib_mean, vib_std = _standardize_temporal_array(X_vib[train_idx], X_vib[val_idx])
-        X_op_train, X_op_val, op_mean, op_std = _standardize_temporal_array(X_op[train_idx], X_op[val_idx])
+        X_aux_train, X_aux_val, aux_mean, aux_std = _standardize_temporal_array(X_aux[train_idx], X_aux[val_idx])
         y_train = y[train_idx].astype(np.float32)
         y_val = y[val_idx].astype(np.float32)
 
         # 데이터 증강 적용 (훈련 데이터만)
         from data_loader import apply_data_augmentation
-        X_vib_train, X_op_train, y_train = apply_data_augmentation(
-            X_vib_train, X_op_train, y_train, aug_prob=AUGMENTATION_PROB
+        X_vib_train, X_aux_train, y_train = apply_data_augmentation(
+            X_vib_train, X_aux_train, y_train, aug_prob=AUGMENTATION_PROB
         )
 
         # RUL log scaling 다시 적용 (원본 스케일이 너무 커서 학습 불가)
@@ -107,7 +108,7 @@ def train_model(
         train_loader = DataLoader(
             TensorDataset(
                 torch.from_numpy(X_vib_train),
-                torch.from_numpy(X_op_train),
+                torch.from_numpy(X_aux_train),
                 torch.from_numpy(y_train).unsqueeze(1),
             ),
             batch_size=batch_size,
@@ -116,7 +117,7 @@ def train_model(
         val_loader = DataLoader(
             TensorDataset(
                 torch.from_numpy(X_vib_val),
-                torch.from_numpy(X_op_val),
+                torch.from_numpy(X_aux_val),
                 torch.from_numpy(y_val).unsqueeze(1),
             ),
             batch_size=batch_size,
@@ -126,7 +127,7 @@ def train_model(
         device = torch.device(DEVICE)
         model = create_model(
             vibration_channels=X_vib.shape[2],
-            operation_features=X_op.shape[-1],
+            auxiliary_dim=X_aux.shape[-1],
             vibration_features=X_vib.shape[3],
         ).to(device)
 
@@ -138,7 +139,8 @@ def train_model(
             model_state = model.state_dict()
             # shape이 일치하는 레이어만 로드 (채널 수 불일치 레이어는 건너뜀)
             matched, skipped = 0, 0
-            for k, v in pretrained_state.items():
+            pretrained_weights = pretrained_state.get("model_state_dict", pretrained_state)
+            for k, v in pretrained_weights.items():
                 if k in model_state and model_state[k].shape == v.shape:
                     model_state[k] = v
                     matched += 1
@@ -151,25 +153,27 @@ def train_model(
         # ─────────────────────────────────────────────────────────────────
 
         criterion = CombinedLoss()
-        # 전이학습 시 Fine-tuning을 위해 학습률을 더 낮게 설정
         ft_lr = learning_rate * 0.5 if pretrained_path.exists() else learning_rate
         optimizer = torch.optim.AdamW(model.parameters(), lr=ft_lr, weight_decay=WEIGHT_DECAY)
-        # 스케줄러를 CosineAnnealingWarmRestarts로 교체하여 수렴 속도 및 성능 향상
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=SCHEDULER_T0, T_mult=2)
 
         print(f"Device: {device} | Train: {len(train_idx)} | Val: {len(val_idx)}")
+
+        best_val_loss = float("inf")
+        patience_count = 0
+        best_state = None
 
 
         for epoch in range(1, epochs + 1):
             model.train()
             train_loss = 0.0
-            for batch_vib, batch_op, batch_y in train_loader:
+            for batch_vib, batch_aux, batch_y in train_loader:
                 batch_vib = batch_vib.to(device)
-                batch_op = batch_op.to(device)
+                batch_aux = batch_aux.to(device)
                 batch_y = batch_y.to(device)
 
                 optimizer.zero_grad()
-                predictions = model(batch_vib, batch_op)
+                predictions = model(batch_vib, batch_aux)
                 loss = criterion(predictions, batch_y)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -179,18 +183,28 @@ def train_model(
             model.eval()
             val_loss = 0.0
             with torch.no_grad():
-                for batch_vib, batch_op, batch_y in val_loader:
+                for batch_vib, batch_aux, batch_y in val_loader:
                     batch_vib = batch_vib.to(device)
-                    batch_op = batch_op.to(device)
+                    batch_aux = batch_aux.to(device)
                     batch_y = batch_y.to(device)
-                    val_loss += criterion(model(batch_vib, batch_op), batch_y).item() * batch_y.size(0)
+                    val_loss += criterion(model(batch_vib, batch_aux), batch_y).item() * batch_y.size(0)
 
             train_loss /= len(train_loader.dataset)
             val_loss /= len(val_loader.dataset)
             scheduler.step()
-            
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_count = 0
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            else:
+                patience_count += 1
+                if patience_count >= EARLY_STOPPING_PATIENCE:
+                    print(f"[Early Stop] Fold {fold+1} - No improvement for {EARLY_STOPPING_PATIENCE} epochs at epoch {epoch}. Stopping.")
+                    break
+
             if epoch % 10 == 0:
-                print(f"Fold {fold+1} - Epoch {epoch:03d}/{epochs} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f}")
+                print(f"Fold {fold+1} - Epoch {epoch:03d}/{epochs} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f} | patience={patience_count}/{EARLY_STOPPING_PATIENCE}")
 
             # 마지막 Fold에서만 시각화 저장 (성능 저하 방지)
             if fold == n_splits - 1 and epoch % 10 == 0:
@@ -208,6 +222,8 @@ def train_model(
 
         fold_model_path = Path(str(model_path).replace(".pt", f"_fold{fold+1}.pt"))
         fold_model_path.parent.mkdir(parents=True, exist_ok=True)
+        if best_state is not None:
+            model.load_state_dict(best_state)
         torch.save(
             {
                 "model_state_dict": model.state_dict(),
@@ -217,13 +233,12 @@ def train_model(
                 "stft_noverlap": STFT_NOVERLAP,
                 "stft_freq_bins": STFT_FREQ_BINS,
                 "vibration_channels": X_vib.shape[2],
-                "operation_features": X_op.shape[-1],
+                "auxiliary_dim": X_aux.shape[-1],
                 "vibration_features": X_vib.shape[3],
-                "operation_feature_names": operation_feature_names(),
                 "vibration_mean": vib_mean,
                 "vibration_std": vib_std,
-                "operation_mean": op_mean,
-                "operation_std": op_std,
+                "auxiliary_mean": aux_mean,
+                "auxiliary_std": aux_std,
             },
             fold_model_path,
         )

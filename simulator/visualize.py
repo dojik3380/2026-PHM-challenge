@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from pathlib import Path
 from scipy.signal import hilbert
+from simulator.physics import get_fault_freq_for_rpm
 
 
 # ============================================================
@@ -105,8 +106,9 @@ def plot_degradation_dashboard(
     vibration = run_data["vibration"]  # (seq_len, n_channels, signal_length)
     seq_len = vibration.shape[0]
     fs = run_data["config"].fs
-    fault_freq = run_data["fault_freq"]
     fault_type = run_data["fault_type"]
+    rpm_mean = float(run_data["rpm_trajectory"].mean())
+    fault_freq = get_fault_freq_for_rpm(fault_type, rpm_mean)
 
     if stages is None:
         stages = [

@@ -1,4 +1,11 @@
-"""STFT 기반 PHM RUL 예측용 데이터 로딩."""
+"""Physics-based STFT RUL 예측용 데이터 로딩.
+
+Operation CSV 의존성을 제거하고, TDMS vibration에서
+STFT 특징 + auxiliary(RPM, RMS) temporal sequence를 생성한다.
+
+Train/Test 모두 동일한 TDMS-only 파이프라인을 사용하여
+modality mismatch를 완전 해소한다.
+"""
 
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
@@ -7,8 +14,9 @@ import numpy as np
 import pandas as pd
 from nptdms import TdmsFile
 
-from config import OPERATION_FEATURES, TRAIN_DIR
-from features import operation_vector, vibration_stft_timestep
+from config import AUXILIARY_DIM, TRAIN_DIR
+from features import vibration_stft_timestep
+from features.rpm_estimator import extract_auxiliary_vector
 
 
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "cp949")
@@ -54,7 +62,7 @@ def _find_column(columns: Iterable[str], candidates: Iterable[str]) -> Optional[
 
 
 def load_operation_csv(csv_path: Path) -> pd.DataFrame:
-    """운전 CSV를 읽고 컬럼명을 표준화한다."""
+    """운전 CSV를 읽고 컬럼명을 표준화한다. RUL label 계산에만 사용."""
     df = _read_csv(csv_path)
     mapping = {
         _find_column(df.columns, ("time_sec", "time", "sec")): "time_sec",
@@ -69,7 +77,7 @@ def load_operation_csv(csv_path: Path) -> pd.DataFrame:
     if "time_sec" not in df.columns:
         raise ValueError(f"{csv_path} must contain time_sec or an equivalent time column.")
 
-    for column in ("time_sec", "torque", "speed", "temp_front", "temp_rear"):
+    for column in ("time_sec",):
         if column not in df.columns:
             df[column] = 0.0
         df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0.0)
@@ -103,7 +111,11 @@ def _find_vibration_dir(case_name: str, root_dir: Path) -> Optional[Path]:
 
 
 def discover_cases(root_dir: Path) -> List[Tuple[str, Path, Path]]:
-    """운전 CSV와 TDMS 진동 폴더가 모두 있는 case를 찾는다."""
+    """운전 CSV와 TDMS 진동 폴더가 모두 있는 case를 찾는다.
+    
+    Train 시에는 RUL label을 위해 operation CSV가 필요하다.
+    (operation CSV에서 max_time 정보를 가져와 RUL을 계산)
+    """
     root_dir = Path(root_dir)
     cases = []
     for csv_path in sorted(root_dir.glob("*_Operation.csv")):
@@ -141,6 +153,12 @@ def _time_from_tdms_index(index: int, max_time: float, total_files: int) -> floa
     return max_time * index / float(total_files - 1)
 
 
+def _extract_auxiliary_from_tdms(tdms_path: Path) -> np.ndarray:
+    """TDMS 파일 1개에서 auxiliary feature [RPM, RMS]를 추출한다."""
+    channel_data = load_tdms_channels(tdms_path)
+    return extract_auxiliary_vector(channel_data)
+
+
 def _case_timesteps(
     operation_csv: Path,
     vibration_dir: Path,
@@ -148,7 +166,8 @@ def _case_timesteps(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     TDMS 파일별 timestep 생성.
-    진동 shape: (num_steps, 4, freq_bins), 운전 shape: (num_steps, 6)
+    진동 shape: (num_steps, 4, freq_bins)
+    auxiliary shape: (num_steps, auxiliary_dim)
     """
     operation_df = load_operation_csv(operation_csv)
     max_time = float(operation_df["time_sec"].max())
@@ -160,21 +179,18 @@ def _case_timesteps(
     tdms_files = all_tdms_files[:max_files] if max_files is not None else all_tdms_files
 
     vibration_steps = []
-    operation_steps = []
+    auxiliary_steps = []
     times = []
-    previous_time = None
 
     for index, tdms_path in enumerate(tdms_files):
         current_time = _time_from_tdms_index(index, max_time, total_files)
-        channel_data = load_tdms_channels(tdms_path)
         vibration_steps.append(vibration_stft_timestep(tdms_path))
-        operation_steps.append(operation_vector(operation_df, current_time, previous_time))
+        auxiliary_steps.append(_extract_auxiliary_from_tdms(tdms_path))
         times.append(current_time)
-        previous_time = current_time
 
     return (
         np.asarray(vibration_steps, dtype=np.float32),
-        np.asarray(operation_steps, dtype=np.float32),
+        np.asarray(auxiliary_steps, dtype=np.float32),
         np.asarray(times, dtype=np.float32),
     )
 
@@ -187,20 +203,20 @@ def build_case_sequences(
     stride: int,
     max_samples: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
-    """정렬된 진동/운전 timestep에 sliding window를 적용한다."""
+    """정렬된 진동/auxiliary timestep에 sliding window를 적용한다."""
     operation_df = load_operation_csv(operation_csv)
     max_files = None
     if max_samples is not None:
         max_files = window_size + max(0, max_samples - 1) * stride
 
-    vibration_steps, operation_steps, times = _case_timesteps(
+    vibration_steps, auxiliary_steps, times = _case_timesteps(
         operation_csv,
         vibration_dir,
         max_files=max_files,
     )
 
     X_vibration = []
-    X_operation = []
+    X_auxiliary = []
     y = []
     metadata = []
 
@@ -210,7 +226,7 @@ def build_case_sequences(
         end = start + window_size
         current_time = float(times[end - 1])
         X_vibration.append(vibration_steps[start:end])
-        X_operation.append(operation_steps[start:end])
+        X_auxiliary.append(auxiliary_steps[start:end])
         y.append(compute_rul(operation_df, current_time))
         metadata.append({"case_name": case_name, "start_time": float(times[start]), "time_sec": current_time})
 
@@ -219,7 +235,7 @@ def build_case_sequences(
 
     return (
         np.asarray(X_vibration, dtype=np.float32),
-        np.asarray(X_operation, dtype=np.float32),
+        np.asarray(X_auxiliary, dtype=np.float32),
         np.asarray(y, dtype=np.float32),
         pd.DataFrame(metadata),
     )
@@ -231,7 +247,10 @@ def build_inference_sequence(
     window_size: int,
     max_samples: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-    """Build one validation/test sequence from the latest available TDMS window."""
+    """Build one validation/test sequence from the latest available TDMS window.
+    
+    Operation CSV 없이 TDMS만으로 vibration + auxiliary를 생성한다.
+    """
     tdms_files = sorted(Path(vibration_dir).glob("*.tdms"))
     if max_samples is not None:
         tdms_files = tdms_files[:max_samples]
@@ -240,11 +259,14 @@ def build_inference_sequence(
 
     selected_files = tdms_files[-window_size:]
     vibration_steps = []
+    auxiliary_steps = []
+
     for tdms_path in selected_files:
         vibration_steps.append(vibration_stft_timestep(tdms_path))
+        auxiliary_steps.append(_extract_auxiliary_from_tdms(tdms_path))
 
     X_vibration = np.asarray([vibration_steps], dtype=np.float32)
-    X_operation = np.zeros((1, window_size, len(OPERATION_FEATURES)), dtype=np.float32)
+    X_auxiliary = np.asarray([auxiliary_steps], dtype=np.float32)
     metadata = pd.DataFrame(
         [
             {
@@ -255,47 +277,50 @@ def build_inference_sequence(
             }
         ]
     )
-    return X_vibration, X_operation, metadata
+    return X_vibration, X_auxiliary, metadata
 
 
-def apply_data_augmentation(X_vib_batch: np.ndarray, X_op_batch: np.ndarray, y_batch: np.ndarray, 
+def apply_data_augmentation(X_vib_batch: np.ndarray, X_aux_batch: np.ndarray, y_batch: np.ndarray, 
                           aug_prob: float = 0.3) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """통합 데이터 증강 적용 (훈련 시에만 사용)"""
+    """통합 데이터 증강 적용 (훈련 시에만 사용)
+    
+    Auxiliary(RPM/RMS)는 물리적 값이므로 시간축 조작만 적용하고
+    값 자체는 변경하지 않는다.
+    """
     from features import augment_stft_features, augment_sequence_level
     
     vib_augmented = []
-    op_augmented = []
+    aux_augmented = []
     y_augmented = []
     
-    for vib_seq, op_seq, y in zip(X_vib_batch, X_op_batch, y_batch):
+    for vib_seq, aux_seq, y in zip(X_vib_batch, X_aux_batch, y_batch):
         # 원본 추가
         vib_augmented.append(vib_seq)
-        op_augmented.append(op_seq)
+        aux_augmented.append(aux_seq)
         y_augmented.append(y)
         
-        # STFT 특징 증강 (각 채널별로)
+        # STFT 특징 증강 (채널별 2D 스펙트로그램으로 처리)
         vib_stft_aug = vib_seq.copy()
         for ch in range(vib_seq.shape[1]):  # 채널별
-            for t in range(vib_seq.shape[0]):  # 타임스텝별
-                stft_features = vib_seq[t, ch]  # (freq_bins,) 
-                vib_stft_aug[t, ch] = augment_stft_features(
-                    stft_features.reshape(-1, 1), aug_prob
-                ).flatten()
+            # vib_seq[:, ch, :] shape: (window_size, freq_bins)
+            # augment_stft_features expects (freq_bins, time_steps)
+            channel_stft = vib_seq[:, ch, :].T  # (freq_bins, window_size)
+            vib_stft_aug[:, ch, :] = augment_stft_features(channel_stft, aug_prob).T
         
         vib_augmented.append(vib_stft_aug)
-        op_augmented.append(op_seq)  # operation은 그대로
+        aux_augmented.append(aux_seq)  # auxiliary는 증강하지 않음
         y_augmented.append(y)
         
         # 시퀀스 레벨 증강
-        seq_augmented = augment_sequence_level(vib_seq, op_seq, y, aug_prob)
-        for vib_aug, op_aug, y_aug in seq_augmented[1:]:  # 원본 제외
+        seq_augmented = augment_sequence_level(vib_seq, aux_seq, y, aug_prob)
+        for vib_aug, aux_aug, y_aug in seq_augmented[1:]:  # 원본 제외
             vib_augmented.append(vib_aug)
-            op_augmented.append(op_aug)
+            aux_augmented.append(aux_aug)
             y_augmented.append(y_aug)
     
     return (
         np.array(vib_augmented, dtype=np.float32),
-        np.array(op_augmented, dtype=np.float32), 
+        np.array(aux_augmented, dtype=np.float32), 
         np.array(y_augmented, dtype=np.float32)
     )
 
@@ -307,18 +332,18 @@ def load_inference_dataset(
 ) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     """Load validation/test TDMS-only cases for RUL submission inference."""
     vib_batches = []
-    op_batches = []
+    aux_batches = []
     metadata_frames = []
 
     for case_name, vibration_dir in discover_vibration_cases(root_dir):
-        X_vib, X_op, metadata = build_inference_sequence(
+        X_vib, X_aux, metadata = build_inference_sequence(
             vibration_dir=vibration_dir,
             case_name=case_name,
             window_size=window_size,
             max_samples=max_samples,
         )
         vib_batches.append(X_vib)
-        op_batches.append(X_op)
+        aux_batches.append(X_aux)
         metadata_frames.append(metadata)
 
     if not vib_batches:
@@ -326,7 +351,7 @@ def load_inference_dataset(
 
     return (
         np.concatenate(vib_batches, axis=0),
-        np.concatenate(op_batches, axis=0),
+        np.concatenate(aux_batches, axis=0),
         pd.concat(metadata_frames, ignore_index=True),
     )
 
@@ -340,11 +365,11 @@ def load_dataset(
     """
     전체 case를 로딩한다.
     X_vibration: (batch, seq_len, 4, freq_bins)
-    X_operation: (batch, seq_len, features)
+    X_auxiliary: (batch, seq_len, auxiliary_dim)
     y: (batch,)
     """
     vib_batches = []
-    op_batches = []
+    aux_batches = []
     targets = []
     metadata_frames = []
 
@@ -354,7 +379,7 @@ def load_dataset(
         if remaining is not None and remaining <= 0:
             break
 
-        X_vib, X_op, y, metadata = build_case_sequences(
+        X_vib, X_aux, y, metadata = build_case_sequences(
             operation_csv=operation_csv,
             vibration_dir=vibration_dir,
             case_name=case_name,
@@ -363,7 +388,7 @@ def load_dataset(
             max_samples=remaining,
         )
         vib_batches.append(X_vib)
-        op_batches.append(X_op)
+        aux_batches.append(X_aux)
         targets.append(y)
         metadata_frames.append(metadata)
 
@@ -372,11 +397,7 @@ def load_dataset(
 
     return (
         np.concatenate(vib_batches, axis=0),
-        np.concatenate(op_batches, axis=0),
+        np.concatenate(aux_batches, axis=0),
         np.concatenate(targets, axis=0),
         pd.concat(metadata_frames, ignore_index=True),
     )
-
-
-def operation_feature_names() -> tuple[str, ...]:
-    return OPERATION_FEATURES
