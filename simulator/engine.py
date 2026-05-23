@@ -24,9 +24,11 @@ from typing import Literal
 
 from .physics import (
     build_impulse_train,
+    build_multi_resonance_impulse_train,
     make_background_vibration,
     add_sideband_modulation,
     sample_fn_zeta,
+    sample_multi_fn_zeta,
     get_fault_freq_for_rpm,
     BEARING_SPECS,
 )
@@ -64,13 +66,16 @@ class SyntheticConfig:
     # 슬립(Jitter) 설정
     slip_range: float = 0.10           # ±10% 타이밍 지터
 
-    # 노이즈 설정
-    healthy_noise_std: float = 0.02    # Healthy 구간 노이즈 크기
-    noise_growth_factor: float = 2.5   # Failure 시점 노이즈 배율
+    # 노이즈 설정 — 실측 RMS(~0.25g)에 맞춰 ~10배 증폭
+    healthy_noise_std: float = 0.15    # 0.02 → 0.15: 실측 noise floor 반영
+    noise_growth_factor: float = 5.0   # 2.5 → 5.0: failure 시점 RMS 폭증 반영
 
     # 진폭 설정 (임펄스)
-    onset_amplitude: float = 0.05     # Onset 시점 초기 임펄스 진폭
-    max_amplitude: float = 3.0        # Rapid Failure 최대 진폭
+    onset_amplitude: float = 0.25     # 0.05 → 0.25
+    max_amplitude: float = 8.0        # 3.0 → 8.0 (실측 max 11.7 고려)
+
+    # 다중 공진 활성화 — 4kHz/6.5kHz/12kHz를 동시에 발현
+    multi_resonance: bool = True
 
     # 채널 다양성
     channel_phase_jitter: float = 0.05  # 채널 간 위상차 (라디안 단위 노이즈로 표현)
@@ -179,19 +184,22 @@ def _generate_rpm_trajectory(config: SyntheticConfig, rng: Generator) -> np.ndar
 def _generate_timestep_signal(
     progress: float,
     config: SyntheticConfig,
-    fn: float,
-    zeta_L: float,
-    zeta_R: float,
+    resonance_modes: list,
     current_rpm: float,
     current_fault_freq: float,
     channel_amp_scale: float,
     rng: Generator,
 ) -> np.ndarray:
-    """하나의 타임스텝, 하나의 채널에 해당하는 1차원 진동 신호를 생성한다."""
+    """하나의 타임스텝, 하나의 채널에 해당하는 1차원 진동 신호를 생성한다.
+
+    resonance_modes:
+        config.multi_resonance=True 시 [(fn, zL, zR, weight), ...]
+        False 시 [(fn, zL, zR, 1.0)] 단일 mode
+    """
     signal_length = int(config.fs * config.signal_duration_sec)
     noise_std = _degradation_noise_std(progress, config)
 
-    # Intermittent burst: Onset 이후 15% 확률로 순간 진폭 급증 (실제 베어링 burst 모사)
+    # Intermittent burst: Onset 이후 15% 확률로 순간 진폭 급증
     base_amplitude = _degradation_amplitude(progress, config) * channel_amp_scale
     if base_amplitude > 0 and progress > 0.45 and rng.uniform() < 0.15:
         burst_factor = float(rng.uniform(2.0, 5.0))
@@ -199,38 +207,32 @@ def _generate_timestep_signal(
     else:
         amplitude = base_amplitude
 
-    # 1. 배경 진동 생성 (RPM 기반, 랜덤 하모닉 차수)
+    # 1. 배경 진동 (RPM 기반, 랜덤 하모닉)
     signal = make_background_vibration(signal_length, current_rpm, noise_std, config.fs, rng)
 
-    # 2. 임펄스 트레인 + AM 사이드밴드 합산 (Onset 이후에만)
+    # 2. 임펄스 트레인 — multi-resonance superposition
     if amplitude > 0:
-        impulse = build_impulse_train(
+        impulse = build_multi_resonance_impulse_train(
             signal_length=signal_length,
             fault_freq=current_fault_freq,
-            fn=fn,
-            zeta_L=zeta_L,
-            zeta_R=zeta_R,
+            modes=resonance_modes,
             amplitude=amplitude,
             slip_range=config.slip_range,
             fs=config.fs,
             rng=rng,
         )
-        # AM 사이드밴드 추가 (fault_freq ± shaft_freq 구조 반영)
         shaft_freq = current_rpm / 60.0
         impulse = add_sideband_modulation(impulse, shaft_freq, config.fs, rng)
         signal += impulse
 
-        # Multi-fault: BSF 또는 Cage 혼합 (열화 후반부에 소량 추가)
         if config.multi_fault and progress > 0.70:
             secondary_type = "BSF" if config.fault_type != "BSF" else "Cage"
             secondary_freq = get_fault_freq_for_rpm(secondary_type, current_rpm)
             secondary_amp = amplitude * rng.uniform(0.15, 0.35)
-            secondary = build_impulse_train(
+            secondary = build_multi_resonance_impulse_train(
                 signal_length=signal_length,
                 fault_freq=secondary_freq,
-                fn=fn,
-                zeta_L=zeta_L,
-                zeta_R=zeta_R,
+                modes=resonance_modes,
                 amplitude=secondary_amp,
                 slip_range=config.slip_range * 1.5,
                 fs=config.fs,
@@ -264,8 +266,14 @@ def generate_run(
 
     # 이 Run 전체에 걸친 물리 파라미터 샘플링 (베어링마다 다른 특성)
     specs = config.bearing_specs if config.bearing_specs is not None else BEARING_SPECS
-    fn, zeta_L, zeta_R = sample_fn_zeta(rng, specs)
-    
+    if config.multi_resonance:
+        resonance_modes = sample_multi_fn_zeta(rng, specs)
+    else:
+        fn, zL, zR = sample_fn_zeta(rng, specs)
+        resonance_modes = [(fn, zL, zR, 1.0)]
+    # 대표 fn / zeta — 메타데이터용 (가장 큰 weight)
+    fn, zeta_L, zeta_R, _ = max(resonance_modes, key=lambda m: m[3])
+
     # RPM trajectory 생성
     rpm_seq = _generate_rpm_trajectory(config, rng)
 
@@ -287,9 +295,7 @@ def generate_run(
             vibration[step_idx, ch, :] = _generate_timestep_signal(
                 progress=float(progress),
                 config=config,
-                fn=fn,
-                zeta_L=zeta_L,
-                zeta_R=zeta_R,
+                resonance_modes=resonance_modes,
                 current_rpm=current_rpm,
                 current_fault_freq=current_fault_freq,
                 channel_amp_scale=float(channel_amp_scales[ch]),

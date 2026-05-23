@@ -31,21 +31,22 @@ BEARING_SPECS = {
         "BSF":  78.0,
         "Cage": 6.7,
     },
-    # 다중모달 공진 주파수 (실제 TDMS에서 4kHz / 12kHz 대역 prominence 관찰)
-    # 형식: (mean_Hz, std_Hz, prob)
+    # 다중모달 공진 주파수 — 실측 스펙트럼(4kHz sharp, 6-7kHz broad, 12kHz sharp) 반영.
+    # 형식: (mean_Hz, std_Hz, weight)
     "fn_modes": [
-        (4000.0,  400.0, 0.70),   # 저주파 housing resonance
-        (12000.0, 700.0, 0.30),   # 고주파 structure resonance
+        (4000.0,  400.0, 0.30),   # 1차 sharp 공진
+        (6500.0,  800.0, 0.30),   # 2차 broad housing resonance
+        (12000.0, 700.0, 0.40),   # 3차 sharp high-freq structure resonance
     ],
-    # JSON calibration fallback 용 단일 모달 통계 (build_bearing_specs_from_json 호환)
-    "fn_mean": 4000.0,
+    # JSON calibration fallback 용 단일 모달 통계
+    "fn_mean": 6500.0,
     "fn_std":  500.0,
     "fn_min":  2000.0,
     "fn_max":  15000.0,
-    # 감쇠비: Uniform(0.01, 0.04) — 음수 방지, 현실적 decay 길이 확보
+    # 감쇠비: Uniform — 음수 방지, 현실적 decay 길이 확보
     "zeta_min": 0.01,
     "zeta_max": 0.04,
-    "zeta_mean": 0.025,   # JSON fallback 용
+    "zeta_mean": 0.025,
     "zeta_std":  0.008,
 }
 
@@ -187,20 +188,22 @@ def make_background_vibration(
     rotation_freq = rpm / 60.0
 
     bg = np.zeros(signal_length, dtype=np.float32)
-    # 가시 하모닉 수를 랜덤화 (1~5차)
-    n_harmonics = rng.integers(1, 6)
-    base_amp = rng.uniform(0.005, 0.02)
+    # 가시 하모닉 수를 랜덤화 (2~8차) — 실측에 풍부한 저주파 하모닉 반영
+    n_harmonics = rng.integers(2, 9)
+    base_amp = rng.uniform(0.03, 0.15)  # 0.005~0.02 → 0.03~0.15 (~7x). 1차 하모닉 과대 방지.
     for k in range(1, n_harmonics + 1):
-        amp   = (base_amp / k) * rng.uniform(0.7, 1.3)
+        # 1/k decay 대신 1/sqrt(k)로 high-order 하모닉을 좀 더 살림
+        amp   = (base_amp / np.sqrt(k)) * rng.uniform(0.7, 1.3)
         phase = rng.uniform(0.0, 2 * np.pi)
         bg += amp * np.sin(2 * np.pi * k * rotation_freq * t + phase).astype(np.float32)
 
-    # 유색 노이즈 (낮은 주파수 강조, IIR AR(1))
-    from scipy.signal import lfilter
-    alpha = 0.3
-    white   = rng.standard_normal(signal_length).astype(np.float32) * noise_std
-    colored = lfilter([alpha], [1.0, -(1.0 - alpha)], white).astype(np.float32)
-    bg += colored
+    # 광대역(거의 white) 배경 노이즈 — 실측 spectrum의 전 대역 floor 반영
+    # 이전 AR(1) 강한 lowpass는 0Hz spike를 만들어 제거
+    white = rng.standard_normal(signal_length).astype(np.float32) * noise_std
+    bg += white
+
+    # DC 제거 (저주파 누적 방지)
+    bg = bg - bg.mean()
     return bg
 
 
@@ -247,6 +250,91 @@ def sample_fn_zeta(
     zeta_L = float(np.clip(zeta * rng.uniform(0.7, 1.0), z_min, z_max))
     zeta_R = float(np.clip(zeta * rng.uniform(1.0, 1.4), z_min, min(z_max * 1.5, 0.30)))
     return fn, zeta_L, zeta_R
+
+
+def sample_multi_fn_zeta(
+    rng: Generator,
+    specs: dict = BEARING_SPECS,
+    max_modes: int = 3,
+) -> list[tuple[float, float, float, float]]:
+    """모든 fn_modes를 동시에 샘플링한다 — superposition용 다중 공진 발현.
+
+    Returns:
+        [(fn, zeta_L, zeta_R, weight), ...] — weight는 mode prob을 사용.
+    """
+    if "fn_modes" not in specs:
+        fn, zL, zR = sample_fn_zeta(rng, specs)
+        return [(fn, zL, zR, 1.0)]
+
+    modes = specs["fn_modes"][:max_modes]
+    results = []
+    z_min = specs.get("zeta_min", 0.01)
+    z_max = specs.get("zeta_max", 0.04)
+    for fn_mean, fn_std, weight in modes:
+        fn_lo = fn_mean * 0.50
+        fn_hi = fn_mean * 1.50
+        fn = float(np.clip(rng.normal(fn_mean, fn_std), fn_lo, fn_hi))
+        zeta = float(rng.uniform(z_min, z_max))
+        zeta_L = float(np.clip(zeta * rng.uniform(0.7, 1.0), z_min, z_max))
+        zeta_R = float(np.clip(zeta * rng.uniform(1.0, 1.4), z_min, min(z_max * 1.5, 0.30)))
+        results.append((fn, zeta_L, zeta_R, float(weight)))
+    return results
+
+
+def build_multi_resonance_impulse_train(
+    signal_length: int,
+    fault_freq: float,
+    modes: list[tuple[float, float, float, float]],
+    amplitude: float,
+    slip_range: float = 0.10,
+    fs: int = 25_600,
+    rng: Generator | None = None,
+) -> np.ndarray:
+    """여러 공진 mode를 superposition한 임펄스 train을 생성한다.
+
+    각 mode는 (fn, zeta_L, zeta_R, weight). 동일 시점에 각 mode의 impulse response를
+    weight 비율로 합성한 뒤 동일 train으로 배치한다.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # 정규화 없이 weighted superposition — 각 mode peak이 spectrum에 그대로 나타남
+    h_list = [(single_impulse_response(fn, zL, zR, fs=fs), w) for fn, zL, zR, w in modes]
+    h_combined = np.zeros_like(h_list[0][0])
+    for h, w in h_list:
+        h_combined += w * h
+
+    h_len = len(h_combined)
+    h_center = h_len // 2
+    T_samples = fs / fault_freq
+
+    y = np.zeros(signal_length, dtype=np.float32)
+    k = 0
+    while True:
+        delta = rng.uniform(-slip_range, slip_range)
+        impulse_center = int(round(k * T_samples * (1.0 + delta)))
+        if impulse_center - h_center >= signal_length:
+            break
+
+        start_sig = impulse_center - h_center
+        end_sig   = start_sig + h_len
+        start_ker = 0
+        end_ker   = h_len
+
+        if end_sig <= 0 or start_sig >= signal_length:
+            k += 1
+            continue
+        if start_sig < 0:
+            start_ker -= start_sig
+            start_sig = 0
+        if end_sig > signal_length:
+            end_ker -= (end_sig - signal_length)
+            end_sig = signal_length
+
+        y[start_sig:end_sig] += amplitude * h_combined[start_ker:end_ker]
+        k += 1
+
+    return y
 
 
 def get_fault_freq_for_rpm(fault_type: str, rpm: float) -> float:

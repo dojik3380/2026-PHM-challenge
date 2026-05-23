@@ -54,10 +54,10 @@ from data_loader import (
     apply_data_augmentation,
     discover_cases,
     load_operation_csv,
-    load_tdms_channels,
+    _extract_auxiliary_from_tdms,
 )
 from features import vibration_stft_timestep
-from features.rpm_estimator import extract_auxiliary_vector, estimate_rpm_trajectory
+from features.rpm_estimator import estimate_rpm_trajectory, extract_rms_from_channels
 from model import CombinedLoss, asymmetric_rul_score_np, create_model
 
 # ── 출력 디렉토리 ─────────────────────────────────────────────────
@@ -121,25 +121,23 @@ def _load_case_timesteps(
     for idx, tdms_path in enumerate(all_tdms):
         t = _time_from_index(idx, max_time, total)
 
-        # STFT 특징
-        vib_feat = vibration_stft_timestep(tdms_path)   # (4, freq_bins)
+        # STFT 특징 (캐시)
+        vib_feat = vibration_stft_timestep(tdms_path)
 
-        # estimated RPM & RMS from TDMS
-        ch_data = load_tdms_channels(tdms_path)
-        est_rpm = estimate_rpm_trajectory(ch_data, fs=SAMPLING_RATE)
-        from features.rpm_estimator import extract_rms_from_channels
-        est_rms = extract_rms_from_channels(ch_data)
+        # estimated RPM & RMS (캐시) — mode B/C/Cplus 공통으로 미리 추출
+        aux_cached = _extract_auxiliary_from_tdms(tdms_path)  # [est_rpm, est_rms]
+        est_rpm, est_rms = float(aux_cached[0]), float(aux_cached[1])
 
         # GT RPM 보간
         gt_rpm = float(np.interp(t, csv_times, csv_rpms))
 
         # mode별 auxiliary 구성
         if mode == 'A':
-            aux = np.array([0.0, 0.0], dtype=np.float32)    # zero aux
+            aux = np.array([0.0, 0.0], dtype=np.float32)
         elif mode == 'B':
-            aux = np.array([gt_rpm, est_rms], dtype=np.float32)  # GT RPM
+            aux = np.array([gt_rpm, est_rms], dtype=np.float32)
         else:  # 'C' or 'Cplus'
-            aux = np.array([est_rpm, est_rms], dtype=np.float32)  # estimated RPM
+            aux = np.array([est_rpm, est_rms], dtype=np.float32)
 
         vib_steps.append(vib_feat)
         aux_steps.append(aux)

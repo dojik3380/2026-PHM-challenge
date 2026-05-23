@@ -154,9 +154,33 @@ def _time_from_tdms_index(index: int, max_time: float, total_files: int) -> floa
 
 
 def _extract_auxiliary_from_tdms(tdms_path: Path) -> np.ndarray:
-    """TDMS 파일 1개에서 auxiliary feature [RPM, RMS]를 추출한다."""
+    """TDMS 파일 1개에서 auxiliary feature [RPM, RMS]를 추출한다 (캐시 지원)."""
+    import hashlib
+    import pickle
+    from config import STFT_CACHE_DIR, STFT_CACHE_ENABLED
+
+    tdms_path = Path(tdms_path)
+    if STFT_CACHE_ENABLED:
+        stat = tdms_path.stat()
+        key = hashlib.md5(f"{tdms_path}:{stat.st_mtime}:v1_aux_harmonic".encode()).hexdigest()
+        cache_file = STFT_CACHE_DIR / f"{key}.pkl"
+        if cache_file.exists():
+            try:
+                with open(cache_file, "rb") as f:
+                    return pickle.load(f)
+            except Exception:
+                pass
+
     channel_data = load_tdms_channels(tdms_path)
-    return extract_auxiliary_vector(channel_data)
+    result = extract_auxiliary_vector(channel_data)
+
+    if STFT_CACHE_ENABLED:
+        try:
+            with open(cache_file, "wb") as f:
+                pickle.dump(result, f)
+        except Exception:
+            pass
+    return result
 
 
 def _case_timesteps(
