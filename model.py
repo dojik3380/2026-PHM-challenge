@@ -1,4 +1,16 @@
-"""STFT + CNN + LSTM 멀티브랜치 RUL 모델."""
+"""STFT + CNN + LSTM RUL 모델 (Physics-based, RPM-auxiliary).
+
+Operation 브랜치를 완전 제거하고, vibration STFT 특징 + RPM/RMS auxiliary
+temporal sequence만으로 RUL을 예측하는 구조.
+
+아키텍처:
+    Vibration Branch:
+        STFT → 1D CNN (SE Block) → Projection → BiLSTM → Temporal Attention
+    Auxiliary:
+        RPM(t), RMS(t) 마지막 timestep 직접 사용
+    Fusion:
+        concat [h_vib_attended, h_aux] → MLP → RUL
+"""
 
 import math
 
@@ -8,9 +20,9 @@ import torch.nn as nn
 
 from config import (
     ASYMMETRIC_WEIGHT,
+    AUXILIARY_DIM,
     DROPOUT,
     HUBER_WEIGHT,
-    OPERATION_FEATURES,
     OVER_EST_PENALTY_SCALE,
     UNDER_EST_PENALTY_SCALE,
     VIBRATION_FEATURES_PER_CHANNEL,
@@ -61,21 +73,24 @@ class PositionalEncoding(nn.Module):
 
 class STFTCNNLSTMRULModel(nn.Module):
     """
-    진동 branch: STFT 입력 -> CNN -> LSTM
-    운전 branch: 운전 시퀀스 -> LSTM
-    Fusion head: 두 branch 출력을 결합해 RUL 예측
+    Physics-based RUL 예측 모델.
+
+    진동 branch: STFT 입력 -> CNN(SE Block) -> BiLSTM -> Temporal Attention
+    Auxiliary:   RPM(t), RMS(t) 마지막 timestep 직접 사용
+    Fusion head: 두 출력을 결합해 RUL 예측
     """
 
     def __init__(
         self,
         vibration_channels: int = 4,
-        operation_features: int = len(OPERATION_FEATURES),
+        auxiliary_dim: int = AUXILIARY_DIM,
         vibration_features: int = VIBRATION_FEATURES_PER_CHANNEL,
         vib_hidden: int = 128,
-        op_hidden: int = 32,
         dropout: float = DROPOUT,
     ):
         super().__init__()
+
+        self.auxiliary_dim = auxiliary_dim
 
         self.vibration_cnn = nn.Sequential(
             nn.Conv1d(vibration_channels, 32, kernel_size=5, padding=2),
@@ -110,14 +125,6 @@ class STFTCNNLSTMRULModel(nn.Module):
             bidirectional=True,
         )
 
-        self.operation_lstm = nn.LSTM(
-            input_size=operation_features,
-            hidden_size=op_hidden,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=True,
-        )
-
         self.pos_encoder = PositionalEncoding(d_model=vib_hidden * 2)
 
         self.temporal_attention = nn.Sequential(
@@ -127,8 +134,19 @@ class STFTCNNLSTMRULModel(nn.Module):
         )
         self.last_attn_weights = None
 
+        # Auxiliary temporal encoder: RPM/RMS 시퀀스 전체를 GRU로 인코딩
+        aux_hidden = 32
+        self.aux_encoder = nn.GRU(
+            input_size=auxiliary_dim,
+            hidden_size=aux_hidden,
+            num_layers=1,
+            batch_first=True,
+        )
+
+        # Fusion head: vib_hidden*2 (vibration attention) + aux_hidden (GRU 마지막 hidden)
+        fusion_input_dim = vib_hidden * 2 + aux_hidden
         self.fusion = nn.Sequential(
-            nn.Linear(vib_hidden * 2 + op_hidden * 2, 128),
+            nn.Linear(fusion_input_dim, 128),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(128, 64),
@@ -136,12 +154,15 @@ class STFTCNNLSTMRULModel(nn.Module):
             nn.Linear(64, 1),
         )
 
-    def forward(self, x_vibration: torch.Tensor, x_operation: torch.Tensor) -> torch.Tensor:
-        # Modality Dropout: 추론(Test) 시 운전 데이터가 0으로 들어오는 환경에 대비하기 위해
-        # 훈련(Train) 시 50% 확률로 운전 데이터를 모두 0으로 지워버려 진동 데이터에 대한 의존도를 높임
-        if self.training and torch.rand(1).item() < 0.5:
-            x_operation = torch.zeros_like(x_operation)
-            
+    def forward(self, x_vibration: torch.Tensor, x_auxiliary: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x_vibration: (batch, seq_len, channels, freq_bins) - STFT magnitude
+            x_auxiliary: (batch, seq_len, auxiliary_dim)        - [RPM(t), RMS(t)]
+
+        Returns:
+            RUL prediction: (batch, 1)
+        """
         # x_vibration: (batch, seq_len, 4, freq_bins)
         batch_size, seq_len, channels, freq_bins = x_vibration.shape
 
@@ -164,14 +185,14 @@ class STFTCNNLSTMRULModel(nn.Module):
         # GPU memory leak 방지를 위해 detach.cpu()로 저장하여 시각화 모듈에서 꺼내 쓸 수 있도록 함
         self.last_attn_weights = attn_weights.detach().cpu()
         
-        h_vib_attended = torch.sum(vib_out * attn_weights, dim=1)
+        h_vib_attended = torch.sum(vib_out * attn_weights, dim=1)  # (batch, vib_hidden*2)
 
-        # 운전 데이터도 별도 BiLSTM으로 시간 흐름을 학습한다.
-        _, (h_op, _) = self.operation_lstm(x_operation)
-        h_op_last = torch.cat([h_op[-2], h_op[-1]], dim=1)  # bidirectional concat
+        # Auxiliary: RPM/RMS 시퀀스 전체를 GRU로 인코딩 → trajectory context 활용
+        _, h_aux_hidden = self.aux_encoder(x_auxiliary)  # h_aux_hidden: (1, batch, aux_hidden)
+        h_aux = h_aux_hidden.squeeze(0)                  # (batch, aux_hidden)
 
-        # Attention fusion
-        fused_input = torch.cat([h_vib_attended, h_op_last], dim=1)
+        # Fusion: vibration attention + auxiliary → MLP → RUL
+        fused_input = torch.cat([h_vib_attended, h_aux], dim=1)
 
         return self.fusion(fused_input)
 
@@ -189,13 +210,16 @@ class AsymmetricRULLoss(nn.Module):
 
     def forward(self, predictions_real: torch.Tensor, targets_real: torch.Tensor) -> torch.Tensor:
         targets_real = targets_real.view_as(predictions_real)
-        denominator = torch.clamp(targets_real, min=1e-6)
-        
+        # RUL=0 근방의 분모 폭발 방지: 1000초 이하는 1000초 기준으로 계산
+        denominator = torch.clamp(targets_real, min=1000.0)
+
         # 백분율 오차(Percentage Error) 계산: 100 * (실제 - 예측) / 실제
-        er = 100.0 * (targets_real - predictions_real) / denominator
-        
-        # A_RUL 점수 공식의 지수(Exponent)에 음수를 취한 값 (-exponent)
-        # 이 식은 완벽한 L1 백분율 오차 형태로 작동하며, 기울기 소실(Vanishing Gradient)이 발생하지 않습니다.
+        # ±500% 클램프로 초기 학습 배치 손실 폭발 방지 (공식 구조 동일)
+        er = torch.clamp(
+            100.0 * (targets_real - predictions_real) / denominator,
+            min=-500.0, max=500.0,
+        )
+
         ln_two = 0.69314718
         loss = torch.where(
             er <= 0,
@@ -221,8 +245,8 @@ class CombinedLoss(nn.Module):
         # Huber Loss는 학습 안정성을 위해 로그 스케일에서 계산 (MSLE와 유사)
         huber_loss = self.huber(predictions, targets)
         
-        # 수치 폭발 방지를 위해 로그 스케일 출력을 안전하게 클리핑 (max RUL ~35000 -> log1p ~10.46)
-        predictions_clamped = torch.clamp(predictions, max=11.5)
+        # 로그 스케일 출력 클리핑: min=0(RUL≥0 보장), max=11.5(≈98715초)
+        predictions_clamped = torch.clamp(predictions, min=0.0, max=11.5)
         
         # Asymmetric Loss는 평가 지표와 동일하게 진짜 스케일(Real Space)의 백분율 오차로 계산
         pred_real = torch.expm1(predictions_clamped)
@@ -247,11 +271,14 @@ def asymmetric_rul_score_np(predictions, targets) -> np.ndarray:
     return np.exp(exponent)
 
 
-def create_model(vibration_channels: int = 4, operation_features: int = len(OPERATION_FEATURES), vibration_features: int = VIBRATION_FEATURES_PER_CHANNEL) -> STFTCNNLSTMRULModel:
+def create_model(
+    vibration_channels: int = 4,
+    auxiliary_dim: int = AUXILIARY_DIM,
+    vibration_features: int = VIBRATION_FEATURES_PER_CHANNEL,
+) -> STFTCNNLSTMRULModel:
     return STFTCNNLSTMRULModel(
         vibration_channels=vibration_channels,
-        operation_features=operation_features,
+        auxiliary_dim=auxiliary_dim,
         vibration_features=vibration_features,
         vib_hidden=128,
-        op_hidden=32,
     )

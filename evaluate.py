@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-from config import DEVICE, MODEL_PATH, PREDICTION_PATH, STRIDE, TEST_DIR, VALIDATION_PREDICTION_PATH, WINDOW_SIZE
+from config import DEVICE, MODEL_PATH, MODELS_DIR, PREDICTION_PATH, STRIDE, TEST_DIR, VALIDATION_PREDICTION_PATH, WINDOW_SIZE
 from data_loader import discover_cases, load_dataset, load_inference_dataset
 from model import asymmetric_rul_score_np, create_model
 
@@ -24,8 +24,8 @@ def _load_trained_model(checkpoint: dict) -> torch.nn.Module:
     device = torch.device(DEVICE)
     model = create_model(
         vibration_channels=checkpoint["vibration_channels"],
-        operation_features=checkpoint["operation_features"],
-        vibration_features=checkpoint.get("vibration_features", 518),
+        auxiliary_dim=checkpoint["auxiliary_dim"],
+        vibration_features=checkpoint.get("vibration_features", 513),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
@@ -49,7 +49,7 @@ def _save_prediction_output(df: pd.DataFrame, output_path: Path) -> None:
 def _predict(
     model: torch.nn.Module,
     X_vib: np.ndarray,
-    X_op: np.ndarray,
+    X_aux: np.ndarray,
     batch_size: int = 512,
 ) -> np.ndarray:
     device = torch.device(DEVICE)
@@ -57,8 +57,8 @@ def _predict(
     with torch.no_grad():
         for start in range(0, len(X_vib), batch_size):
             vib_batch = torch.from_numpy(X_vib[start:start + batch_size]).to(device)
-            op_batch = torch.from_numpy(X_op[start:start + batch_size]).to(device)
-            predictions.append(model(vib_batch, op_batch).cpu().numpy().reshape(-1))
+            aux_batch = torch.from_numpy(X_aux[start:start + batch_size]).to(device)
+            predictions.append(model(vib_batch, aux_batch).cpu().numpy().reshape(-1))
     return np.concatenate(predictions)
 
 
@@ -147,7 +147,7 @@ def evaluate_model(
     TDMS-only 테스트 세트가 주어지면 `predict_validation` 방식으로 파일별 RUL 스코어만 생성합니다.
     """
     if _has_operation_cases(data_dir):
-        X_vib_raw, X_op_raw, y, metadata = load_dataset(
+        X_vib_raw, X_aux_raw, y, metadata = load_dataset(
             root_dir=data_dir,
             window_size=window_size,
             stride=stride,
@@ -165,9 +165,9 @@ def evaluate_model(
         for f_path in fold_paths:
             checkpoint = torch.load(f_path, map_location="cpu")
             X_vib = _apply_standardization(X_vib_raw, checkpoint["vibration_mean"], checkpoint["vibration_std"])
-            X_op = _apply_standardization(X_op_raw, checkpoint["operation_mean"], checkpoint["operation_std"])
+            X_aux = _apply_standardization(X_aux_raw, checkpoint["auxiliary_mean"], checkpoint["auxiliary_std"])
             model = _load_trained_model(checkpoint)
-            all_preds.append(_predict(model, X_vib, X_op))
+            all_preds.append(_predict(model, X_vib, X_aux))
             
         y_pred = np.mean(all_preds, axis=0)
         y_pred = np.expm1(y_pred)
@@ -221,7 +221,7 @@ def predict_validation(
     max_samples: Optional[int] = None,
 ) -> pd.DataFrame:
     """Create a validation RUL score Excel file from TDMS-only cases."""
-    X_vib_raw, X_op_raw, metadata = load_inference_dataset(
+    X_vib_raw, X_aux_raw, metadata = load_inference_dataset(
         root_dir=data_dir,
         window_size=window_size,
         max_samples=max_samples,
@@ -238,9 +238,9 @@ def predict_validation(
     for f_path in fold_paths:
         checkpoint = torch.load(f_path, map_location="cpu")
         X_vib = _apply_standardization(X_vib_raw, checkpoint["vibration_mean"], checkpoint["vibration_std"])
-        X_op = _apply_standardization(X_op_raw, checkpoint["operation_mean"], checkpoint["operation_std"])
+        X_aux = _apply_standardization(X_aux_raw, checkpoint["auxiliary_mean"], checkpoint["auxiliary_std"])
         model = _load_trained_model(checkpoint)
-        all_preds.append(_predict(model, X_vib, X_op))
+        all_preds.append(_predict(model, X_vib, X_aux))
         
     y_pred = np.mean(all_preds, axis=0)
     y_pred = np.expm1(y_pred)
@@ -265,4 +265,24 @@ def predict_validation(
 
 
 if __name__ == "__main__":
-    evaluate_model()
+    import argparse
+    parser = argparse.ArgumentParser(description="PHM RUL 평가")
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default=None,
+        help="모델 파일명 (확장자 제외). 예: RUL_Baseline, RUL_TDMSOnly. "
+             "미지정 시 config.py의 MODEL_PATH 사용.",
+    )
+    parser.add_argument("--data-dir", type=str, default=None, help="평가 데이터 디렉토리")
+    args = parser.parse_args()
+
+    eval_model_path = MODEL_PATH
+    if args.model_name:
+        eval_model_path = MODELS_DIR / f"{args.model_name}.pt"
+
+    eval_data_dir = Path(args.data_dir) if args.data_dir else TEST_DIR
+
+    print(f"Model : {eval_model_path.stem}")
+    print(f"Data  : {eval_data_dir}")
+    evaluate_model(data_dir=eval_data_dir, model_path=eval_model_path)
