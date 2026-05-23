@@ -188,19 +188,39 @@ def make_background_vibration(
     rotation_freq = rpm / 60.0
 
     bg = np.zeros(signal_length, dtype=np.float32)
-    # 가시 하모닉 수를 랜덤화 (2~8차) — 실측에 풍부한 저주파 하모닉 반영
-    n_harmonics = rng.integers(2, 9)
-    base_amp = rng.uniform(0.03, 0.15)  # 0.005~0.02 → 0.03~0.15 (~7x). 1차 하모닉 과대 방지.
+    # 회전 하모닉을 high-order까지 확장 — 실측의 0-1.5kHz 풍부한 line spectrum 모사
+    # RPM 880 기준 회전 주파수 14.7Hz → 100차 = 1470Hz, 30차부터 mechanical resonance로 amplified
+    n_harmonics = rng.integers(40, 80)  # 2~8 → 40~80차 (저주파 line spectrum 풍부)
+    base_amp = rng.uniform(0.03, 0.10)
+    # 30차 이후 high-order는 mechanical resonance에 의해 boost되는 영역 모사
     for k in range(1, n_harmonics + 1):
-        # 1/k decay 대신 1/sqrt(k)로 high-order 하모닉을 좀 더 살림
-        amp   = (base_amp / np.sqrt(k)) * rng.uniform(0.7, 1.3)
+        # k^0.6 decay: 매우 high-order도 충분히 살아남음
+        amp = (base_amp / (k ** 0.6)) * rng.uniform(0.5, 1.5)
+        # 30~80차 영역에 boost (mechanical 공진과의 결합 시뮬레이션)
+        if 30 <= k <= 80:
+            amp *= rng.uniform(1.5, 3.0)
         phase = rng.uniform(0.0, 2 * np.pi)
         bg += amp * np.sin(2 * np.pi * k * rotation_freq * t + phase).astype(np.float32)
 
     # 광대역(거의 white) 배경 노이즈 — 실측 spectrum의 전 대역 floor 반영
-    # 이전 AR(1) 강한 lowpass는 0Hz spike를 만들어 제거
     white = rng.standard_normal(signal_length).astype(np.float32) * noise_std
     bg += white
+
+    # 공진 대역 연속 excitation — mean spectrum에 공진 피크가 나타나도록
+    # 700Hz/1100Hz mid-freq mechanical + 4kHz/6.5kHz/12kHz structure resonance
+    resonance_excitation = 0.20
+    for fn_center, weight, jitter_pct, n_lines in [
+        (700.0,   0.25, 0.04, 5),   # mid-freq mechanical cluster #1 (gear/cage harmonics)
+        (1100.0,  0.20, 0.05, 5),   # mid-freq mechanical cluster #2
+        (4000.0,  0.30, 0.02, 3),   # 1차 sharp structure resonance
+        (6500.0,  0.30, 0.05, 4),   # 2차 broad housing resonance
+        (12000.0, 0.40, 0.02, 3),   # 3차 sharp high-freq resonance
+    ]:
+        for _ in range(n_lines):
+            fn_jit = fn_center * (1.0 + rng.normal(0.0, jitter_pct))
+            amp_jit = resonance_excitation * weight * rng.uniform(0.6, 1.4)
+            phase = rng.uniform(0.0, 2 * np.pi)
+            bg += amp_jit * np.sin(2 * np.pi * fn_jit * t + phase).astype(np.float32)
 
     # DC 제거 (저주파 누적 방지)
     bg = bg - bg.mean()

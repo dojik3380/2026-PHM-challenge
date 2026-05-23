@@ -28,7 +28,24 @@ from config import (
     WEIGHT_DECAY,
     WINDOW_SIZE,
     AUGMENTATION_PROB,
+    MIXUP_ALPHA,
+    MIXUP_PROB,
 )
+
+
+def _mixup_batch(x_vib: torch.Tensor, x_aux: torch.Tensor, y: torch.Tensor,
+                 alpha: float = MIXUP_ALPHA, prob: float = MIXUP_PROB):
+    """Batch-level Mixup. alpha<=0 또는 prob 확률 미달 시 원본 반환."""
+    if alpha <= 0.0 or np.random.random() > prob:
+        return x_vib, x_aux, y
+    lam = float(np.random.beta(alpha, alpha))
+    # 극단값 회피: lam을 [0.5, 1.0]로 reflect
+    lam = max(lam, 1.0 - lam)
+    perm = torch.randperm(x_vib.size(0), device=x_vib.device)
+    x_vib_m = lam * x_vib + (1.0 - lam) * x_vib[perm]
+    x_aux_m = lam * x_aux + (1.0 - lam) * x_aux[perm]
+    y_m = lam * y + (1.0 - lam) * y[perm]
+    return x_vib_m, x_aux_m, y_m
 from data_loader import load_dataset
 from model import AsymmetricRULLoss, CombinedLoss, create_model
 
@@ -172,6 +189,9 @@ def train_model(
                 batch_vib = batch_vib.to(device)
                 batch_aux = batch_aux.to(device)
                 batch_y = batch_y.to(device)
+
+                # Mixup: 같은 batch 내에서 sample pair를 lambda 비율로 섞는다.
+                batch_vib, batch_aux, batch_y = _mixup_batch(batch_vib, batch_aux, batch_y)
 
                 optimizer.zero_grad()
                 predictions = model(batch_vib, batch_aux)
