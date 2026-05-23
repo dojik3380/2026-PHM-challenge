@@ -42,25 +42,27 @@ SAMPLING_RATE = 25_600
 STFT_NPERSEG = 1024
 STFT_NOVERLAP = STFT_NPERSEG // 2
 STFT_FREQ_BINS = STFT_NPERSEG // 2 + 1
-VIBRATION_FEATURES_PER_CHANNEL = STFT_FREQ_BINS  # STFT magnitude only (handcrafted 제거)
+VIBRATION_FEATURES_PER_CHANNEL = STFT_FREQ_BINS * 2  # mean + std concatenated (513×2=1026)
 
 # 모델 학습 설정
 WINDOW_SIZE = 32
-STRIDE = 4
-EPOCHS = 60
-BATCH_SIZE = 8
-LEARNING_RATE = 1e-4
+STRIDE = 1          # 4→1: 케이스당 윈도우 수 ~24→~95개, 훈련 샘플 4배 증가
+
+EPOCHS = 80         # 도메인 갭 적응에 더 많은 epoch 필요
+BATCH_SIZE = 16
+LEARNING_RATE = 5e-4  
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
 DROPOUT = 0.3
 WEIGHT_DECAY = 0.0          # L2 regularization strength (fine-tuning)
+
 PRETRAIN_LR = 3e-4          # pretrain 전용 학습률
-PRETRAIN_EPOCHS = 60        # pretrain 전용 epoch
+PRETRAIN_EPOCHS = 20        # pretrain 전용 epoch
 PRETRAIN_BATCH_SIZE = 32    # pretrain 전용 배치 크기
 PRETRAIN_WEIGHT_DECAY = 1e-4  # pretrain 전용 L2 regularization
 SCHEDULER_T0 = 10           # CosineAnnealingWarmRestarts 첫 주기 (pretrain/train 공용)
 EARLY_STOPPING_PATIENCE = 15  # val_loss 개선 없을 때 조기 종료 기준 epoch (pretrain/train 공용)
-AUGMENTATION_PROB = 0.3  # Data augmentation probability (0.0: 증강 끔, 0.3: 기본, 0.5: 강한 증강)
+AUGMENTATION_PROB = 0.1     # 0.3→0.1: 데이터 적을 때 과한 증강이 train/val 괴리 유발
 
 # Loss 설정
 HUBER_WEIGHT = 0.7 # Huber loss의 가중치

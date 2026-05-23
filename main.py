@@ -13,6 +13,7 @@ from config import (
     EPOCHS,
     LEARNING_RATE,
     MODEL_PATH,
+    MODELS_DIR,
     PREDICTION_PATH,
     STRIDE,
     TEAM_NAME,
@@ -56,7 +57,10 @@ def parse_args() -> argparse.Namespace:
 
     eval_parser = subparsers.add_parser("evaluate", help="Evaluate the trained model")
     eval_parser.add_argument("--data-dir", type=Path, default=TEST_DIR)
-    eval_parser.add_argument("--model-path", type=Path, default=MODEL_PATH)
+    eval_parser.add_argument("--model-path", type=Path, default=None,
+                             help="모델 파일 전체 경로. --model-name과 함께 쓰면 --model-name 우선.")
+    eval_parser.add_argument("--model-name", type=str, default=None,
+                             help="모델 이름(확장자 제외). 예: RUL_Baseline, RUL_TDMSOnly")
     eval_parser.add_argument("--output-path", type=Path, default=PREDICTION_PATH)
     eval_parser.add_argument("--window-size", type=int, default=WINDOW_SIZE)
     eval_parser.add_argument("--stride", type=int, default=STRIDE)
@@ -95,9 +99,15 @@ def main() -> None:
                 window_size=args.window_size,
             )
     elif args.command == "evaluate":
+        if args.model_name:
+            resolved_model_path = MODELS_DIR / f"{args.model_name}.pt"
+        elif args.model_path:
+            resolved_model_path = args.model_path
+        else:
+            resolved_model_path = MODEL_PATH
         evaluate_model(
             data_dir=args.data_dir,
-            model_path=args.model_path,
+            model_path=resolved_model_path,
             output_path=args.output_path,
             window_size=args.window_size,
             stride=args.stride,

@@ -32,7 +32,7 @@ from scipy.signal import stft as scipy_stft
 
 from config import (
     SAMPLING_RATE, STFT_NPERSEG, STFT_NOVERLAP, STFT_FREQ_BINS,
-    WINDOW_SIZE, STRIDE,
+    VIBRATION_FEATURES_PER_CHANNEL, WINDOW_SIZE, STRIDE,
 )
 from simulator.engine import SyntheticConfig, generate_dataset
 from simulator.physics import single_impulse_response, sample_fn_zeta, BEARING_SPECS
@@ -133,19 +133,22 @@ def extract_stft_features(
     noverlap: int = STFT_NOVERLAP,
 ) -> np.ndarray:
     """
-    1D 진동 신호에서 STFT magnitude를 추출한다.
-    출력 shape: (freq_bins,) = (513,)
-    features/vibration.py의 vibration_stft_timestep과 동일한 규격.
-    boundary=None, padded=False로 실제 파이프라인과 일치시킨다.
+    1D 진동 신호에서 STFT 특징 벡터를 추출한다.
+    출력 shape: (VIBRATION_FEATURES_PER_CHANNEL,) = (1026,)
+    concat(mean(|Zxx|), std(|Zxx|)) — features/vibration.py와 동일한 규격.
+    boundary=None, padded=False로 실제 파이프라인과 일치.
     """
+    def _pad_or_trim(v: np.ndarray) -> np.ndarray:
+        if v.size < STFT_FREQ_BINS:
+            return np.pad(v, (0, STFT_FREQ_BINS - v.size))
+        return v[:STFT_FREQ_BINS]
+
     _, _, Zxx = scipy_stft(signal, fs=fs, nperseg=nperseg, noverlap=noverlap,
                            boundary=None, padded=False)
-    mag = np.mean(np.abs(Zxx), axis=1).astype(np.float32)
-    if mag.size < STFT_FREQ_BINS:
-        mag = np.pad(mag, (0, STFT_FREQ_BINS - mag.size))
-    elif mag.size > STFT_FREQ_BINS:
-        mag = mag[:STFT_FREQ_BINS]
-    return mag
+    mag = np.abs(Zxx)
+    freq_mean = _pad_or_trim(np.mean(mag, axis=1)).astype(np.float32)
+    freq_std  = _pad_or_trim(np.std(mag,  axis=1)).astype(np.float32)
+    return np.concatenate([freq_mean, freq_std])  # (VIBRATION_FEATURES_PER_CHANNEL,)
 
 
 def extract_rms(signal: np.ndarray) -> float:
@@ -185,7 +188,7 @@ def build_pretrain_arrays(
         seq_len, n_channels, _ = vib.shape
 
         # 채널별 STFT + RMS 특징 추출
-        stft_features = np.zeros((seq_len, n_channels, 513), dtype=np.float32)
+        stft_features = np.zeros((seq_len, n_channels, VIBRATION_FEATURES_PER_CHANNEL), dtype=np.float32)
         rms_features = np.zeros((seq_len, n_channels), dtype=np.float32)
         
         for step in range(seq_len):
@@ -358,6 +361,7 @@ if __name__ == "__main__":
     parser.add_argument("--slip",       type=float, default=0.10,         help="타이밍 지터 비율 (0.10=±10%)")
     parser.add_argument("--window",     type=int,   default=WINDOW_SIZE,  help="슬라이딩 윈도우 크기")
     parser.add_argument("--stride",     type=int,   default=STRIDE,       help="슬라이딩 윈도우 스트라이드")
+    parser.add_argument("--total-life-sec", type=float, default=70000.0,  help="합성 RUL 총 수명(초) — 실제 데이터 평균에 맞춤")
     parser.add_argument("--multi-fault",action="store_true",              help="다중 결함 혼합 활성화")
     parser.add_argument("--no-json",    action="store_true",              help="physics_parameters.json 무시하고 기본값 사용")
     parser.add_argument("--seed",       type=int,   default=42,           help="랜덤 시드")

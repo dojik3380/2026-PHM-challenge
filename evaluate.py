@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-from config import DEVICE, MODEL_PATH, PREDICTION_PATH, STRIDE, TEST_DIR, VALIDATION_PREDICTION_PATH, WINDOW_SIZE
+from config import DEVICE, MODEL_PATH, MODELS_DIR, PREDICTION_PATH, STRIDE, TEST_DIR, VALIDATION_PREDICTION_PATH, WINDOW_SIZE
 from data_loader import discover_cases, load_dataset, load_inference_dataset
 from model import asymmetric_rul_score_np, create_model
 
@@ -265,4 +265,24 @@ def predict_validation(
 
 
 if __name__ == "__main__":
-    evaluate_model()
+    import argparse
+    parser = argparse.ArgumentParser(description="PHM RUL 평가")
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default=None,
+        help="모델 파일명 (확장자 제외). 예: RUL_Baseline, RUL_TDMSOnly. "
+             "미지정 시 config.py의 MODEL_PATH 사용.",
+    )
+    parser.add_argument("--data-dir", type=str, default=None, help="평가 데이터 디렉토리")
+    args = parser.parse_args()
+
+    eval_model_path = MODEL_PATH
+    if args.model_name:
+        eval_model_path = MODELS_DIR / f"{args.model_name}.pt"
+
+    eval_data_dir = Path(args.data_dir) if args.data_dir else TEST_DIR
+
+    print(f"Model : {eval_model_path.stem}")
+    print(f"Data  : {eval_data_dir}")
+    evaluate_model(data_dir=eval_data_dir, model_path=eval_model_path)

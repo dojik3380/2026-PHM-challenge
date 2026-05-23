@@ -25,6 +25,7 @@ from typing import Literal
 from .physics import (
     build_impulse_train,
     make_background_vibration,
+    add_sideband_modulation,
     sample_fn_zeta,
     get_fault_freq_for_rpm,
     BEARING_SPECS,
@@ -52,9 +53,9 @@ class SyntheticConfig:
     # 운전 조건 (Switching RPM)
     rpm_low_range: tuple = (700.0, 760.0)   # low-speed regime
     rpm_high_range: tuple = (940.0, 980.0)  # high-speed regime
-    rpm_switch_steps: int = 15              # regime당 유지 timestep 수
+    rpm_switch_steps: int = 40              # regime당 유지 timestep 수 (≥ window_size 권장)
     rpm_transition_steps: int = 3           # 전환에 걸리는 timestep 수
-    rpm_jitter: float = 5.0                 # ±RPM 변동 (운전 불안정성)
+    rpm_jitter: float = 10.0               # ±RPM 변동 (운전 불안정성)
 
     # 결함 설정
     fault_type: Literal["BPFI", "BPFO", "BSF"] = "BPFO"
@@ -79,8 +80,10 @@ class SyntheticConfig:
     impulse_duration_ms: float = 3.0
 
     # RUL 스케일: 실제 데이터 수명 범위(초)에 맞게 설정
-    # Train1=75251s, 전체 평균을 고려해 기본값 70000으로 설정
+    # Train1=75251s, Train2=67979s, Train3=53225s, Train4=82613s → 범위 50000~90000
     total_life_seconds: float = 70000.0
+    total_life_seconds_min: float = 50000.0  # run별 수명 랜덤화 하한
+    total_life_seconds_max: float = 90000.0  # run별 수명 랜덤화 상한
 
     # 재현성
     seed: int | None = None
@@ -186,13 +189,20 @@ def _generate_timestep_signal(
 ) -> np.ndarray:
     """하나의 타임스텝, 하나의 채널에 해당하는 1차원 진동 신호를 생성한다."""
     signal_length = int(config.fs * config.signal_duration_sec)
-    amplitude = _degradation_amplitude(progress, config) * channel_amp_scale
     noise_std = _degradation_noise_std(progress, config)
 
-    # 1. 배경 진동 생성 (RPM 기반)
+    # Intermittent burst: Onset 이후 15% 확률로 순간 진폭 급증 (실제 베어링 burst 모사)
+    base_amplitude = _degradation_amplitude(progress, config) * channel_amp_scale
+    if base_amplitude > 0 and progress > 0.45 and rng.uniform() < 0.15:
+        burst_factor = float(rng.uniform(2.0, 5.0))
+        amplitude = base_amplitude * burst_factor
+    else:
+        amplitude = base_amplitude
+
+    # 1. 배경 진동 생성 (RPM 기반, 랜덤 하모닉 차수)
     signal = make_background_vibration(signal_length, current_rpm, noise_std, config.fs, rng)
 
-    # 2. 임펄스 트레인 합산 (Onset 이후에만)
+    # 2. 임펄스 트레인 + AM 사이드밴드 합산 (Onset 이후에만)
     if amplitude > 0:
         impulse = build_impulse_train(
             signal_length=signal_length,
@@ -205,6 +215,9 @@ def _generate_timestep_signal(
             fs=config.fs,
             rng=rng,
         )
+        # AM 사이드밴드 추가 (fault_freq ± shaft_freq 구조 반영)
+        shaft_freq = current_rpm / 60.0
+        impulse = add_sideband_modulation(impulse, shaft_freq, config.fs, rng)
         signal += impulse
 
         # Multi-fault: BSF 또는 Cage 혼합 (열화 후반부에 소량 추가)
@@ -212,7 +225,7 @@ def _generate_timestep_signal(
             secondary_type = "BSF" if config.fault_type != "BSF" else "Cage"
             secondary_freq = get_fault_freq_for_rpm(secondary_type, current_rpm)
             secondary_amp = amplitude * rng.uniform(0.15, 0.35)
-            signal += build_impulse_train(
+            secondary = build_impulse_train(
                 signal_length=signal_length,
                 fault_freq=secondary_freq,
                 fn=fn,
@@ -223,6 +236,8 @@ def _generate_timestep_signal(
                 fs=config.fs,
                 rng=rng,
             )
+            secondary = add_sideband_modulation(secondary, shaft_freq, config.fs, rng)
+            signal += secondary
 
     return signal
 
@@ -322,20 +337,26 @@ def generate_dataset(
 
         # 각 Run마다 독립 RNG (재현 가능)
         run_seed = int(master_rng.integers(0, 2**31))
+        run_rng = np.random.default_rng(run_seed)
+
+        # 실제 데이터처럼 run마다 수명을 랜덤화
+        life_sec = float(run_rng.uniform(config.total_life_seconds_min,
+                                         config.total_life_seconds_max))
+
         run_config = SyntheticConfig(
             **{
                 **config.__dict__,
                 "fault_type": fault_type,
                 "seed": run_seed,
+                "total_life_seconds": life_sec,
             }
         )
-        run_rng = np.random.default_rng(run_seed)
         run_data = generate_run(run_config, rng=run_rng)
         runs.append(run_data)
 
         if verbose and (i + 1) % 10 == 0:
             print(f"  [Engine] Generated {i + 1}/{n_runs} runs | "
-                  f"fault={fault_type} | fn={run_data['fn']:.1f}Hz | "
-                  f"zeta_L={run_data['zeta_L']:.4f}")
+                  f"fault={fault_type} | life={life_sec:.0f}s | "
+                  f"fn={run_data['fn']:.1f}Hz | zeta_L={run_data['zeta_L']:.4f}")
 
     return runs

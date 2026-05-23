@@ -280,49 +280,51 @@ def build_inference_sequence(
     return X_vibration, X_auxiliary, metadata
 
 
-def apply_data_augmentation(X_vib_batch: np.ndarray, X_aux_batch: np.ndarray, y_batch: np.ndarray, 
+def apply_data_augmentation(X_vib_batch: np.ndarray, X_aux_batch: np.ndarray, y_batch: np.ndarray,
                           aug_prob: float = 0.3) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """통합 데이터 증강 적용 (훈련 시에만 사용)
-    
+
     Auxiliary(RPM/RMS)는 물리적 값이므로 시간축 조작만 적용하고
     값 자체는 변경하지 않는다.
     """
     from features import augment_stft_features, augment_sequence_level
-    
-    vib_augmented = []
-    aux_augmented = []
-    y_augmented = []
-    
+
+    N = len(y_batch)
+    # 최대 4배 증강(원본 + STFT aug + 시퀀스 aug 최대 2개)을 가정해 pre-allocate
+    MAX_FACTOR = 4
+    vib_buf = np.empty((N * MAX_FACTOR, *X_vib_batch.shape[1:]), dtype=np.float32)
+    aux_buf = np.empty((N * MAX_FACTOR, *X_aux_batch.shape[1:]), dtype=np.float32)
+    y_buf   = np.empty(N * MAX_FACTOR, dtype=np.float32)
+    idx = 0
+
     for vib_seq, aux_seq, y in zip(X_vib_batch, X_aux_batch, y_batch):
-        # 원본 추가
-        vib_augmented.append(vib_seq)
-        aux_augmented.append(aux_seq)
-        y_augmented.append(y)
-        
-        # STFT 특징 증강 (채널별 2D 스펙트로그램으로 처리)
+        # 원본
+        vib_buf[idx] = vib_seq
+        aux_buf[idx] = aux_seq
+        y_buf[idx]   = y
+        idx += 1
+
+        # STFT 특징 증강
         vib_stft_aug = vib_seq.copy()
-        for ch in range(vib_seq.shape[1]):  # 채널별
-            # vib_seq[:, ch, :] shape: (window_size, freq_bins)
-            # augment_stft_features expects (freq_bins, time_steps)
+        for ch in range(vib_seq.shape[1]):
             channel_stft = vib_seq[:, ch, :].T  # (freq_bins, window_size)
             vib_stft_aug[:, ch, :] = augment_stft_features(channel_stft, aug_prob).T
-        
-        vib_augmented.append(vib_stft_aug)
-        aux_augmented.append(aux_seq)  # auxiliary는 증강하지 않음
-        y_augmented.append(y)
-        
+        vib_buf[idx] = vib_stft_aug
+        aux_buf[idx] = aux_seq
+        y_buf[idx]   = y
+        idx += 1
+
         # 시퀀스 레벨 증강
         seq_augmented = augment_sequence_level(vib_seq, aux_seq, y, aug_prob)
-        for vib_aug, aux_aug, y_aug in seq_augmented[1:]:  # 원본 제외
-            vib_augmented.append(vib_aug)
-            aux_augmented.append(aux_aug)
-            y_augmented.append(y_aug)
-    
-    return (
-        np.array(vib_augmented, dtype=np.float32),
-        np.array(aux_augmented, dtype=np.float32), 
-        np.array(y_augmented, dtype=np.float32)
-    )
+        for vib_aug, aux_aug, y_aug in seq_augmented[1:]:
+            if idx >= len(y_buf):
+                break
+            vib_buf[idx] = vib_aug
+            aux_buf[idx] = aux_aug
+            y_buf[idx]   = y_aug
+            idx += 1
+
+    return vib_buf[:idx], aux_buf[:idx], y_buf[:idx]
 
 
 def load_inference_dataset(

@@ -134,8 +134,17 @@ class STFTCNNLSTMRULModel(nn.Module):
         )
         self.last_attn_weights = None
 
-        # Fusion head: vib_hidden*2 (vibration attention) + auxiliary_dim (RPM, RMS)
-        fusion_input_dim = vib_hidden * 2 + auxiliary_dim
+        # Auxiliary temporal encoder: RPM/RMS 시퀀스 전체를 GRU로 인코딩
+        aux_hidden = 32
+        self.aux_encoder = nn.GRU(
+            input_size=auxiliary_dim,
+            hidden_size=aux_hidden,
+            num_layers=1,
+            batch_first=True,
+        )
+
+        # Fusion head: vib_hidden*2 (vibration attention) + aux_hidden (GRU 마지막 hidden)
+        fusion_input_dim = vib_hidden * 2 + aux_hidden
         self.fusion = nn.Sequential(
             nn.Linear(fusion_input_dim, 128),
             nn.ReLU(),
@@ -178,9 +187,9 @@ class STFTCNNLSTMRULModel(nn.Module):
         
         h_vib_attended = torch.sum(vib_out * attn_weights, dim=1)  # (batch, vib_hidden*2)
 
-        # Auxiliary: 마지막 timestep의 RPM/RMS를 직접 사용
-        # (RPM/RMS는 이미 scalar이므로 별도 LSTM 불필요)
-        h_aux = x_auxiliary[:, -1, :]  # (batch, auxiliary_dim)
+        # Auxiliary: RPM/RMS 시퀀스 전체를 GRU로 인코딩 → trajectory context 활용
+        _, h_aux_hidden = self.aux_encoder(x_auxiliary)  # h_aux_hidden: (1, batch, aux_hidden)
+        h_aux = h_aux_hidden.squeeze(0)                  # (batch, aux_hidden)
 
         # Fusion: vibration attention + auxiliary → MLP → RUL
         fused_input = torch.cat([h_vib_attended, h_aux], dim=1)
@@ -201,13 +210,16 @@ class AsymmetricRULLoss(nn.Module):
 
     def forward(self, predictions_real: torch.Tensor, targets_real: torch.Tensor) -> torch.Tensor:
         targets_real = targets_real.view_as(predictions_real)
-        denominator = torch.clamp(targets_real, min=1e-6)
-        
+        # RUL=0 근방의 분모 폭발 방지: 1000초 이하는 1000초 기준으로 계산
+        denominator = torch.clamp(targets_real, min=1000.0)
+
         # 백분율 오차(Percentage Error) 계산: 100 * (실제 - 예측) / 실제
-        er = 100.0 * (targets_real - predictions_real) / denominator
-        
-        # A_RUL 점수 공식의 지수(Exponent)에 음수를 취한 값 (-exponent)
-        # 이 식은 완벽한 L1 백분율 오차 형태로 작동하며, 기울기 소실(Vanishing Gradient)이 발생하지 않습니다.
+        # ±500% 클램프로 초기 학습 배치 손실 폭발 방지 (공식 구조 동일)
+        er = torch.clamp(
+            100.0 * (targets_real - predictions_real) / denominator,
+            min=-500.0, max=500.0,
+        )
+
         ln_two = 0.69314718
         loss = torch.where(
             er <= 0,
@@ -233,8 +245,8 @@ class CombinedLoss(nn.Module):
         # Huber Loss는 학습 안정성을 위해 로그 스케일에서 계산 (MSLE와 유사)
         huber_loss = self.huber(predictions, targets)
         
-        # 수치 폭발 방지를 위해 로그 스케일 출력을 안전하게 클리핑 (max RUL ~35000 -> log1p ~10.46)
-        predictions_clamped = torch.clamp(predictions, max=11.5)
+        # 로그 스케일 출력 클리핑: min=0(RUL≥0 보장), max=11.5(≈98715초)
+        predictions_clamped = torch.clamp(predictions, min=0.0, max=11.5)
         
         # Asymmetric Loss는 평가 지표와 동일하게 진짜 스케일(Real Space)의 백분율 오차로 계산
         pred_real = torch.expm1(predictions_clamped)

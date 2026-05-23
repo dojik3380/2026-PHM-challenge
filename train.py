@@ -153,7 +153,8 @@ def train_model(
         # ─────────────────────────────────────────────────────────────────
 
         criterion = CombinedLoss()
-        ft_lr = learning_rate * 0.5 if pretrained_path.exists() else learning_rate
+        # pretrain 도메인 갭이 클 경우 더 빠른 적응을 위해 lr을 높임
+        ft_lr = learning_rate if pretrained_path.exists() else learning_rate
         optimizer = torch.optim.AdamW(model.parameters(), lr=ft_lr, weight_decay=WEIGHT_DECAY)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=SCHEDULER_T0, T_mult=2)
 

@@ -50,14 +50,25 @@ def vibration_statistics(signal: Iterable[float]) -> Dict[str, float]:
     }
 
 
+def _pad_or_trim(vec: np.ndarray, target: int) -> np.ndarray:
+    if vec.size < target:
+        return np.pad(vec, (0, target - vec.size))
+    return vec[:target]
+
+
 def stft_magnitude_vector(signal: Iterable[float]) -> np.ndarray:
     """
-    채널 1개의 raw 진동 신호를 STFT magnitude 벡터로 변환한다.
-    STFT time 축은 평균내서 freq_bins 길이의 벡터로 만든다.
+    채널 1개의 raw 진동 신호를 STFT 특징 벡터로 변환한다.
+
+    출력: concat(mean(|Zxx|, axis=time), std(|Zxx|, axis=time))
+    shape: (STFT_FREQ_BINS * 2,) = (1026,)
+
+    mean: 평균 스펙트럼 — 어느 주파수가 활성화됐는지
+    std : 시간적 변동성 — 임펄스성 결함 주파수 검출에 핵심
     """
     arr = _finite_array(signal)
     if arr.size == 0:
-        return np.zeros(STFT_FREQ_BINS, dtype=np.float32)
+        return np.zeros(STFT_FREQ_BINS * 2, dtype=np.float32)
 
     if arr.size < STFT_NPERSEG:
         arr = np.pad(arr, (0, STFT_NPERSEG - arr.size))
@@ -71,14 +82,10 @@ def stft_magnitude_vector(signal: Iterable[float]) -> np.ndarray:
         padded=False,
     )
     magnitude = np.abs(zxx)
-    freq_vector = np.mean(magnitude, axis=1)
+    freq_mean = _pad_or_trim(np.mean(magnitude, axis=1), STFT_FREQ_BINS)
+    freq_std  = _pad_or_trim(np.std(magnitude,  axis=1), STFT_FREQ_BINS)
 
-    if freq_vector.size < STFT_FREQ_BINS:
-        freq_vector = np.pad(freq_vector, (0, STFT_FREQ_BINS - freq_vector.size))
-    elif freq_vector.size > STFT_FREQ_BINS:
-        freq_vector = freq_vector[:STFT_FREQ_BINS]
-
-    return freq_vector.astype(np.float32)
+    return np.concatenate([freq_mean, freq_std]).astype(np.float32)
 
 
 def vibration_stft_timestep(
@@ -86,9 +93,9 @@ def vibration_stft_timestep(
 ) -> np.ndarray:
     """
     TDMS 파일 1개를 STFT timestep으로 변환 (캐시 지원).
-    출력 shape: (4, STFT_FREQ_BINS) = (4, 513)
+    출력 shape: (4, STFT_FREQ_BINS * 2) = (4, 1026) — mean + std concatenated
 
-    Handcrafted features 제거 — STFT magnitude만 사용.
+    Handcrafted features 제거 — STFT mean+std만 사용.
     """
     import hashlib
     import pickle
@@ -98,7 +105,7 @@ def vibration_stft_timestep(
     
     # 캐시 키 생성 (파일 경로 + 수정시간 + 'v2' 접미사로 기존 캐시와 분리)
     file_stat = tdms_path.stat()
-    cache_key = hashlib.md5(f"{tdms_path}:{file_stat.st_mtime}:v3_stft_mean".encode()).hexdigest()
+    cache_key = hashlib.md5(f"{tdms_path}:{file_stat.st_mtime}:v4_stft_mean_std".encode()).hexdigest()
     cache_file = STFT_CACHE_DIR / f"{cache_key}.pkl"
     
     # 캐시 히트 시 로드
@@ -171,31 +178,44 @@ def augment_stft_features(stft_matrix: np.ndarray, aug_prob: float = 0.3) -> np.
 
 
 def augment_sequence_level(X_vib: np.ndarray, X_aux: np.ndarray, y: float, aug_prob: float = 0.3) -> list:
-    """시퀀스 레벨 증강 (시간축 조작).
-    
-    Auxiliary(RPM/RMS)는 물리적 값이므로 vibration과 동일하게
-    시간축만 조작한다 (값 자체는 변경하지 않음).
+    """시퀀스 레벨 증강.
+
+    RUL은 시간적 인과관계가 있으므로 시퀀스 반전(flip) 금지.
+    적용 증강:
+      1. 유색 노이즈 추가 (SNR 변동 모사)
+      2. 진폭 스케일링 (센서 감도 변동 모사)
+      3. 랜덤 시간 이동 (window 위치 jitter)
     """
-    augmented = [(X_vib, X_aux, y)]  # 원본 유지
-    
-    # 1. 가벼운 시간 반전 (물리적 의미 유지)
-    if np.random.random() < aug_prob * 0.6:
-        vib_reversed = np.flip(X_vib, axis=1)
-        aux_reversed = np.flip(X_aux, axis=0)
-        augmented.append((vib_reversed, aux_reversed, y))
-    
-    # 2. 가벼운 시간 이동 (shift) 증강
-    if np.random.random() < aug_prob * 0.4:
+    augmented = [(X_vib, X_aux, y)]
+
+    # 1. 유색 노이즈 (AR(1) colored noise — 실제 기계 배경 노이즈 모사)
+    if np.random.random() < aug_prob:
+        alpha = 0.3
+        noise_std = np.random.uniform(0.005, 0.02)
+        white = np.random.randn(*X_vib.shape).astype(np.float32) * noise_std
+        # 시간축(axis=0)을 따라 IIR 필터 적용 (간이 AR)
+        colored = white.copy()
+        for t in range(1, X_vib.shape[0]):
+            colored[t] = alpha * white[t] + (1 - alpha) * colored[t - 1]
+        augmented.append((X_vib + colored, X_aux, y))
+
+    # 2. 진폭 스케일링 (Uniform(0.85, 1.15))
+    if np.random.random() < aug_prob:
+        scale = np.random.uniform(0.85, 1.15)
+        augmented.append((X_vib * scale, X_aux, y))
+
+    # 3. 랜덤 시간 이동 (shift) — 경계를 edge로 채워 causality 보존
+    if np.random.random() < aug_prob * 0.5:
         shift = np.random.randint(-4, 5)
         if shift != 0:
             vib_shifted = np.roll(X_vib, shift, axis=0)
             aux_shifted = np.roll(X_aux, shift, axis=0)
             if shift > 0:
-                vib_shifted[:shift] = X_vib[0:1]
-                aux_shifted[:shift] = X_aux[0:1]
+                vib_shifted[:shift]  = X_vib[0:1]
+                aux_shifted[:shift]  = X_aux[0:1]
             else:
-                vib_shifted[shift:] = X_vib[-1:]
-                aux_shifted[shift:] = X_aux[-1:]
+                vib_shifted[shift:]  = X_vib[-1:]
+                aux_shifted[shift:]  = X_aux[-1:]
             augmented.append((vib_shifted, aux_shifted, y))
-    
+
     return augmented
