@@ -18,12 +18,9 @@ if str(_project_root) not in sys.path:
 
 from config import (
     SAMPLING_RATE,
-    STFT_CACHE_DIR,
-    STFT_CACHE_ENABLED,
     STFT_FREQ_BINS,
     STFT_NOVERLAP,
     STFT_NPERSEG,
-    VIBRATION_CHANNELS,
 )
 
 
@@ -86,59 +83,6 @@ def stft_magnitude_vector(signal: Iterable[float]) -> np.ndarray:
     freq_std  = _pad_or_trim(np.std(magnitude,  axis=1), STFT_FREQ_BINS)
 
     return np.concatenate([freq_mean, freq_std]).astype(np.float32)
-
-
-def vibration_stft_timestep(
-    tdms_file_path: str | Path,
-) -> np.ndarray:
-    """
-    TDMS 파일 1개를 STFT timestep으로 변환 (캐시 지원).
-    출력 shape: (4, STFT_FREQ_BINS * 2) = (4, 1026) — mean + std concatenated
-
-    Handcrafted features 제거 — STFT mean+std만 사용.
-    """
-    import hashlib
-    import pickle
-    from pathlib import Path
-
-    tdms_path = Path(tdms_file_path)
-    
-    # 캐시 키 생성 (파일 경로 + 수정시간 + 'v2' 접미사로 기존 캐시와 분리)
-    file_stat = tdms_path.stat()
-    cache_key = hashlib.md5(f"{tdms_path}:{file_stat.st_mtime}:v4_stft_mean_std".encode()).hexdigest()
-    cache_file = STFT_CACHE_DIR / f"{cache_key}.pkl"
-    
-    # 캐시 히트 시 로드
-    if STFT_CACHE_ENABLED and cache_file.exists():
-        try:
-            with open(cache_file, 'rb') as f:
-                return pickle.load(f)
-        except Exception:
-            pass  # 캐시 로드 실패 시 재계산
-    
-    # 캐시 미스 시 계산
-    from data_loader import load_tdms_channels
-    channel_data = load_tdms_channels(tdms_path)
-    
-    normalized = {name.upper(): values for name, values in channel_data.items()}
-    stft_vectors = []
-    
-    for channel in VIBRATION_CHANNELS:
-        signal = np.array(normalized.get(channel.upper(), []), dtype=np.float32)
-        stft_vectors.append(stft_magnitude_vector(signal))
-    
-    # STFT only: (4, STFT_FREQ_BINS)
-    result = np.stack(stft_vectors, axis=0).astype(np.float32)
-    
-    # 캐시 저장
-    if STFT_CACHE_ENABLED:
-        try:
-            with open(cache_file, 'wb') as f:
-                pickle.dump(result, f)
-        except Exception:
-            pass  # 캐시 저장 실패 시 무시
-    
-    return result
 
 
 def augment_stft_features(stft_matrix: np.ndarray, aug_prob: float = 0.3) -> np.ndarray:

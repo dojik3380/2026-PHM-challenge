@@ -1,288 +1,172 @@
-"""STFT + CNN + LSTM PHM RUL 모델 평가."""
+"""Ensemble inference on data/Test using HI fold checkpoints.
 
+For each Test case:
+  1. Build all sliding windows (the full HI trajectory).
+  2. Average HI predictions across fold checkpoints.
+  3. Curve-fit the averaged HI sequence and extrapolate to threshold.
+  4. RUL = t_failure - t_last_window.
+
+Writes File / RUL_Score Excel.
+"""
+
+from __future__ import annotations
+
+import argparse
 from pathlib import Path
 from typing import Optional
-from xml.sax.saxutils import escape
-from zipfile import ZIP_DEFLATED, ZipFile
 
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-from config import DEVICE, MODEL_PATH, MODELS_DIR, PREDICTION_PATH, STRIDE, TEST_DIR, VALIDATION_PREDICTION_PATH, WINDOW_SIZE
-from data_loader import discover_cases, load_dataset, load_inference_dataset
-from model import asymmetric_rul_score_np, create_model
-
-
-def _apply_standardization(array: np.ndarray, mean: torch.Tensor, std: torch.Tensor) -> np.ndarray:
-    """학습 때 저장한 평균/표준편차로 표준화한다."""
-    return ((array - mean.cpu().numpy()) / std.cpu().numpy()).astype(np.float32)
+from config import DEVICE, RESULTS_DIR, TEAM_NAME, TEST_DIR, WINDOW_SIZE
+from data_loader import load_inference_dataset
+from inference import hi_sequence_to_rul
+from model import create_model
+from train import MODEL_PATH
 
 
-def _load_trained_model(checkpoint: dict) -> torch.nn.Module:
-    device = torch.device(DEVICE)
+def _standardize(arr: np.ndarray, mean, std) -> np.ndarray:
+    m = mean.cpu().numpy() if isinstance(mean, torch.Tensor) else np.asarray(mean)
+    s = std.cpu().numpy() if isinstance(std, torch.Tensor) else np.asarray(std)
+    s = np.where(s < 1e-8, 1.0, s)
+    return ((arr - m) / s).astype(np.float32)
+
+
+def _discover_fold_checkpoints(model_path: Path) -> list[Path]:
+    model_path = Path(model_path)
+    pattern_seed = f"{model_path.stem}_seed*_fold*.pt"
+    pattern_plain = f"{model_path.stem}_fold*.pt"
+    folds = sorted(set(model_path.parent.glob(pattern_seed)) | set(model_path.parent.glob(pattern_plain)))
+    if folds:
+        return folds
+    if model_path.exists():
+        return [model_path]
+    raise FileNotFoundError(f"No fold checkpoints near {model_path}")
+
+
+def _load_fold(ckpt_path: Path, device: torch.device):
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model = create_model(
-        vibration_channels=checkpoint["vibration_channels"],
-        auxiliary_dim=checkpoint["auxiliary_dim"],
-        vibration_features=checkpoint.get("vibration_features", 513),
+        vibration_channels=ckpt["vibration_channels"],
+        vibration_features=ckpt["vibration_features"],
+        handcrafted_dim=ckpt["handcrafted_dim"],
     ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    return model
+    return model, ckpt
 
 
-def _has_operation_cases(root_dir: Path) -> bool:
-    """Return True when the directory contains labeled operation cases."""
-    return bool(discover_cases(root_dir))
-
-
-def _save_prediction_output(df: pd.DataFrame, output_path: Path) -> None:
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if output_path.suffix.lower() in (".xlsx", ".xls"):
-        _save_xlsx(df, output_path)
-    else:
-        df.to_csv(output_path, index=False)
-
-
-def _predict(
-    model: torch.nn.Module,
-    X_vib: np.ndarray,
-    X_aux: np.ndarray,
-    batch_size: int = 512,
-) -> np.ndarray:
-    device = torch.device(DEVICE)
-    predictions = []
+def _predict_hi(model: torch.nn.Module, X_vib: np.ndarray, X_feat: np.ndarray,
+                device: torch.device, batch_size: int = 16) -> np.ndarray:
+    preds: list[np.ndarray] = []
+    n = len(X_vib)
     with torch.no_grad():
-        for start in range(0, len(X_vib), batch_size):
-            vib_batch = torch.from_numpy(X_vib[start:start + batch_size]).to(device)
-            aux_batch = torch.from_numpy(X_aux[start:start + batch_size]).to(device)
-            predictions.append(model(vib_batch, aux_batch).cpu().numpy().reshape(-1))
-    return np.concatenate(predictions)
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            vb = torch.from_numpy(np.ascontiguousarray(X_vib[start:end])).to(device)
+            fb = torch.from_numpy(np.ascontiguousarray(X_feat[start:end])).to(device)
+            out = model(vb, fb).squeeze(1).cpu().numpy()
+            preds.append(out)
+    return np.concatenate(preds, axis=0)
 
 
-def _write_minimal_xlsx(df: pd.DataFrame, output_path: Path) -> None:
-    """openpyxl 없이 File/RUL_Score 형식의 최소 xlsx 파일을 저장한다."""
-    rows = [list(df.columns)] + df.astype(object).values.tolist()
-
-    def cell_ref(row_idx: int, col_idx: int) -> str:
-        return f"{chr(ord('A') + col_idx)}{row_idx}"
-
-    sheet_rows = []
-    for row_idx, row in enumerate(rows, start=1):
-        cells = []
-        for col_idx, value in enumerate(row):
-            ref = cell_ref(row_idx, col_idx)
-            if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
-                cells.append(f'<c r="{ref}"><v>{value}</v></c>')
-            else:
-                text = escape(str(value))
-                cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{text}</t></is></c>')
-        sheet_rows.append(f'<row r="{row_idx}">{"".join(cells)}</row>')
-
-    sheet_xml = (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        f'<sheetData>{"".join(sheet_rows)}</sheetData>'
-        '</worksheet>'
-    )
-
-    with ZipFile(output_path, "w", ZIP_DEFLATED) as xlsx:
-        xlsx.writestr(
-            "[Content_Types].xml",
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-            '<Default Extension="xml" ContentType="application/xml"/>'
-            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-            '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
-            '</Types>',
-        )
-        xlsx.writestr(
-            "_rels/.rels",
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
-            '</Relationships>',
-        )
-        xlsx.writestr(
-            "xl/workbook.xml",
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-            '<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>'
-            '</workbook>',
-        )
-        xlsx.writestr(
-            "xl/_rels/workbook.xml.rels",
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
-            '</Relationships>',
-        )
-        xlsx.writestr("xl/worksheets/sheet1.xml", sheet_xml)
-
-
-def _save_xlsx(df: pd.DataFrame, output_path: Path) -> None:
-    """openpyxl이 있으면 pandas를 쓰고, 없으면 내장 writer를 쓴다."""
-    try:
-        df.to_excel(output_path, index=False)
-    except ModuleNotFoundError as exc:
-        if exc.name != "openpyxl":
-            raise
-        _write_minimal_xlsx(df, output_path)
-
-
-def evaluate_model(
-    data_dir: Path = TEST_DIR,
+def evaluate_test(
+    test_dir: Path = TEST_DIR,
     model_path: Path = MODEL_PATH,
-    output_path: Optional[Path] = PREDICTION_PATH,
+    output_path: Optional[Path] = None,
     window_size: int = WINDOW_SIZE,
-    stride: int = STRIDE,
-    max_samples: Optional[int] = None,
-) -> dict:
-    """추론 후 MAE, RMSE, A_RUL을 계산한다.
-
-    TDMS-only 테스트 세트가 주어지면 `predict_validation` 방식으로 파일별 RUL 스코어만 생성합니다.
-    """
-    if _has_operation_cases(data_dir):
-        X_vib_raw, X_aux_raw, y, metadata = load_dataset(
-            root_dir=data_dir,
-            window_size=window_size,
-            stride=stride,
-            max_samples=max_samples,
-        )
-
-        model_dir = Path(model_path).parent
-        base_name = Path(model_path).stem
-        fold_paths = sorted(list(model_dir.glob(f"{base_name}_fold*.pt")))
-        if not fold_paths:
-            fold_paths = [Path(model_path)]
-
-        all_preds = []
-        print(f"Loading {len(fold_paths)} model(s) for ensemble prediction...")
-        for f_path in fold_paths:
-            checkpoint = torch.load(f_path, map_location="cpu")
-            X_vib = _apply_standardization(X_vib_raw, checkpoint["vibration_mean"], checkpoint["vibration_std"])
-            X_aux = _apply_standardization(X_aux_raw, checkpoint["auxiliary_mean"], checkpoint["auxiliary_std"])
-            model = _load_trained_model(checkpoint)
-            all_preds.append(_predict(model, X_vib, X_aux))
-            
-        y_pred = np.mean(all_preds, axis=0)
-        y_pred = np.expm1(y_pred)
-        print(f"y_pred[:5] after expm1: {y_pred[:5]}")
-
-        arul = asymmetric_rul_score_np(y_pred, y)
-        metrics = {
-            "MAE": float(mean_absolute_error(y, y_pred)),
-            "RMSE": float(np.sqrt(mean_squared_error(y, y_pred))),
-            "A_RUL": float(np.mean(arul)),
-        }
-
-        print(f"MAE: {metrics['MAE']:.6f}")
-        print(f"RMSE: {metrics['RMSE']:.6f}")
-        print(f"A_RUL: {metrics['A_RUL']:.6f}")
-
-        if output_path is not None:
-            output_path = Path(output_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            results = metadata.copy()
-            results["true_RUL"] = y
-            results["predicted_RUL"] = y_pred
-            results["error"] = y_pred - y
-            results["A_RUL"] = arul
-            results.to_csv(output_path, index=False)
-            print(f"Saved predictions to {output_path}")
-
-        return metrics
-
-    print(f"No labeled operation cases found in {data_dir}. Running TDMS-only inference instead.")
-    validation_results = predict_validation(
-        data_dir=data_dir,
-        model_path=model_path,
-        output_path=output_path if output_path is not None else VALIDATION_PREDICTION_PATH,
-        window_size=window_size,
-        max_samples=max_samples,
-    )
-
-    return {
-        "mode": "tdms_only_inference",
-        "cases": len(validation_results),
-        "output_path": str(output_path if output_path is not None else VALIDATION_PREDICTION_PATH),
-    }
-
-
-def predict_validation(
-    data_dir: Path = TEST_DIR,
-    model_path: Path = MODEL_PATH,
-    output_path: Optional[Path] = VALIDATION_PREDICTION_PATH,
-    window_size: int = WINDOW_SIZE,
-    max_samples: Optional[int] = None,
+    use_cache: bool = True,
 ) -> pd.DataFrame:
-    """Create a validation RUL score Excel file from TDMS-only cases."""
-    X_vib_raw, X_aux_raw, metadata = load_inference_dataset(
-        root_dir=data_dir,
-        window_size=window_size,
-        max_samples=max_samples,
+    test_dir = Path(test_dir)
+    model_path = Path(model_path)
+    if output_path is None:
+        output_path = RESULTS_DIR / f"{TEAM_NAME}_validation.xlsx"
+    output_path = Path(output_path)
+
+    fold_paths = _discover_fold_checkpoints(model_path)
+    print(f"Found {len(fold_paths)} fold checkpoint(s):")
+    for fp in fold_paths:
+        print(f"  - {fp.name}")
+
+    first_ckpt = torch.load(fold_paths[0], map_location="cpu", weights_only=False)
+    baseline = first_ckpt.get("degradation_baseline")
+    if baseline is None:
+        raise RuntimeError(
+            f"Checkpoint {fold_paths[0].name} has no 'degradation_baseline'. "
+            f"Retrain with the current pipeline."
+        )
+
+    print(f"\nBuilding inference dataset from {test_dir} (window_size={window_size}) ...")
+    X_vib_raw, X_feat_raw, metadata = load_inference_dataset(
+        test_dir, window_size=window_size, stride=1,
+        use_cache=use_cache, degradation_baseline=baseline,
     )
+    print(f"Inference dataset: vib={X_vib_raw.shape} feat={X_feat_raw.shape}")
+    print(metadata.groupby("case_name").size().to_string())
 
-    model_dir = Path(model_path).parent
-    base_name = Path(model_path).stem
-    fold_paths = sorted(list(model_dir.glob(f"{base_name}_fold*.pt")))
-    if not fold_paths:
-        fold_paths = [Path(model_path)]
+    device = torch.device(DEVICE)
+    fold_hi: list[np.ndarray] = []
+    for fp in fold_paths:
+        model, ckpt = _load_fold(fp, device)
+        X_vib = _standardize(X_vib_raw, ckpt["vibration_mean"], ckpt["vibration_std"])
+        X_feat = _standardize(X_feat_raw, ckpt["feature_mean"], ckpt["feature_std"])
+        hi = _predict_hi(model, X_vib, X_feat, device)
+        print(f"  {fp.name}: HI mean={hi.mean():.3f} range=[{hi.min():.3f}, {hi.max():.3f}]")
+        fold_hi.append(hi)
+    hi_ensemble = np.mean(np.stack(fold_hi, axis=0), axis=0)
 
-    all_preds = []
-    print(f"Loading {len(fold_paths)} model(s) for ensemble prediction...")
-    for f_path in fold_paths:
-        checkpoint = torch.load(f_path, map_location="cpu")
-        X_vib = _apply_standardization(X_vib_raw, checkpoint["vibration_mean"], checkpoint["vibration_std"])
-        X_aux = _apply_standardization(X_aux_raw, checkpoint["auxiliary_mean"], checkpoint["auxiliary_std"])
-        model = _load_trained_model(checkpoint)
-        all_preds.append(_predict(model, X_vib, X_aux))
-        
-    y_pred = np.mean(all_preds, axis=0)
-    y_pred = np.expm1(y_pred)
+    # Stage 2: per-case curve fit -> RUL at the LAST window.
+    results = []
+    for case_name in sorted(metadata["case_name"].unique()):
+        mask = (metadata["case_name"] == case_name).to_numpy()
+        case_meta = metadata[mask].sort_values("end_timestep").reset_index(drop=True)
+        case_times = case_meta["time_sec"].to_numpy(dtype=np.float64)
+        case_hi = hi_ensemble[mask][case_meta.index.to_numpy()]
+        # case_meta is already sorted; align hi by re-applying argsort if needed
+        order = np.argsort(case_meta["end_timestep"].to_numpy())
+        case_times = case_times[order]
+        case_hi = case_hi[order]
+        t_now = float(case_times[-1])
+        t_fail = hi_sequence_to_rul(case_times, case_hi, t_now=t_now, case_max=None)
+        rul = max(0.0, t_fail - t_now)
+        results.append({
+            "File": case_name,
+            "RUL_Score": int(round(rul)),
+            "hi_last": float(case_hi[-1]),
+            "hi_mean": float(case_hi.mean()),
+            "n_windows": int(mask.sum()),
+        })
 
-    file_names = metadata["case_name"].astype(str).tolist()
-    # Use original case names if they start with 'test' or 'validation', otherwise use Validation{i+1}
-    if not all(name.lower().startswith(("test", "validation")) for name in file_names):
-        file_names = [f"Validation{i + 1}" for i in range(len(file_names))]
+    df = pd.DataFrame(results)
+    print("\nPredictions:")
+    print(df.to_string(index=False))
 
-    results = pd.DataFrame(
-        {
-            "File": file_names,
-            "RUL_Score": np.rint(np.maximum(y_pred, 0.0)).astype(int),
-        }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df_out = df[["File", "RUL_Score"]]
+    if output_path.suffix.lower() in (".xlsx", ".xls"):
+        df_out.to_excel(output_path, index=False)
+    else:
+        df_out.to_csv(output_path, index=False)
+    print(f"\nSaved {output_path}")
+    return df
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="HI ensemble inference on TDMS Test set")
+    p.add_argument("--test-dir", type=Path, default=TEST_DIR)
+    p.add_argument("--model-path", type=Path, default=MODEL_PATH)
+    p.add_argument("--output", type=Path, default=None,
+                   help=f"default: results/{TEAM_NAME}_validation.xlsx")
+    p.add_argument("--window-size", type=int, default=WINDOW_SIZE)
+    p.add_argument("--no-cache", action="store_true")
+    args = p.parse_args()
+    evaluate_test(
+        test_dir=args.test_dir, model_path=args.model_path,
+        output_path=args.output, window_size=args.window_size,
+        use_cache=not args.no_cache,
     )
-
-    if output_path is not None:
-        _save_prediction_output(results, Path(output_path))
-        print(f"Saved validation RUL score file to {output_path}")
-
-    return results
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="PHM RUL 평가")
-    parser.add_argument(
-        "--model-name",
-        type=str,
-        default=None,
-        help="모델 파일명 (확장자 제외). 예: RUL_Baseline, RUL_TDMSOnly. "
-             "미지정 시 config.py의 MODEL_PATH 사용.",
-    )
-    parser.add_argument("--data-dir", type=str, default=None, help="평가 데이터 디렉토리")
-    args = parser.parse_args()
-
-    eval_model_path = MODEL_PATH
-    if args.model_name:
-        eval_model_path = MODELS_DIR / f"{args.model_name}.pt"
-
-    eval_data_dir = Path(args.data_dir) if args.data_dir else TEST_DIR
-
-    print(f"Model : {eval_model_path.stem}")
-    print(f"Data  : {eval_data_dir}")
-    evaluate_model(data_dir=eval_data_dir, model_path=eval_model_path)
+    main()

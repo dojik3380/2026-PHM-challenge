@@ -1,24 +1,17 @@
-## 2026-PHM-challenge
-# KSPHM-KIMM 기계 데이터 챌린지 2026 코드 저장소
+# PHM RUL Training
 
-- 데이터 샘플링 레이트 (Sampling Rate)
+This repository now uses one training path: original `data/Train` and `data2/Train_No_*` are always trained together with the multi-branch model.
 
-- 진동 신호: 25.6 kHz
+## Train
 
-- 이외 신호: 0.1 Hz
+```powershell
+& "C:\Users\kdj33\miniconda3\envs\phm\python.exe" main.py train --epochs 80
+```
 
-- 데이터 수집 주기
- 
-- 10분 주기로 1분씩 취득 (테스트베드는 연속적으로 운전)
+For a quick cache/smoke run, cap samples per case:
 
-# 시험 중단 조건과 데이터 특성
- 
-- 베어링이 중단 조건에 도달하면 실험이 종료됨
+```powershell
+& "C:\Users\kdj33\miniconda3\envs\phm\python.exe" main.py train --max-samples 96 --epochs 2
+```
 
-- 데이터 측정 중 고장이 발생할 경우, 고장 시점의 데이터가 포함
-
-- 데이터 미측정 중 고장이 발생할 경우, 고장 시점의 데이터가 불포함
-
-- **실제 고장 시점과 마지막 데이터 측정 시간은 일치하지 않을 수** 있으며,  이는 예측 모델에서 고려되어야 할 중요한 변수임
-
-
+The first run builds STFT/feature caches in `data2_features/`; later runs reuse them.

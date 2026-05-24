@@ -22,13 +22,11 @@ coverage.xml
 .hypothesis
 .vscode/
 data/
+data2/
 models/
 results/
-<<<<<<< HEAD
-stft_cache/
-=======
 outputs/
->>>>>>> test
+data2_features/
 *.tdms
 *.xlsx
 *.csv

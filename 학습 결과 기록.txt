@@ -1,6 +1,0 @@
-2026.05.13 Train set 평가
-File	RUL_Score(Tdms only)	실제 RUL	이벨류에서 계산한 실제 RUL	이벨류에서 예측한 RUL
-Validation1	1789	75000	56588.75	44551.305
-Validation2	15998	68000	49329.895	38386.043
-Validation3	1305	53000	34475.28	24684.133
-Validation4	11471	82613	63782.094	56512.402
