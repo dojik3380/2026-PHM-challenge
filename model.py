@@ -23,12 +23,13 @@ import torch
 import torch.nn as nn
 
 from config import (
-    ASYMMETRIC_WEIGHT,
     DROPOUT,
     HANDCRAFTED_DIM,
     HI_FEATURES_ENABLED,
-    HUBER_WEIGHT,
+    HI_LOSS_WEIGHT,
     OVER_EST_PENALTY_SCALE,
+    RANKING_LOSS_WEIGHT,
+    RUL_LOSS_WEIGHT,
     UNDER_EST_PENALTY_SCALE,
     VIB_HIDDEN,
     VIBRATION_FEATURES_PER_CHANNEL,
@@ -72,10 +73,10 @@ class PositionalEncoding(nn.Module):
 
 
 class AsymmetricRULLoss(nn.Module):
-    """Per-window asymmetric loss in REAL (seconds) space.
+    """A_RUL metric in REAL (seconds) space — used for EVALUATION ONLY, not training.
 
-    Matches the competition A_RUL score gradient. Over-prediction
-    (pred > target) is penalized 2.5x harder than under-prediction.
+    Over-prediction (pred > target) is penalized 2.5× harder than under-prediction,
+    matching the competition scoring function.
     """
 
     def __init__(self, over_scale: float = OVER_EST_PENALTY_SCALE,
@@ -86,7 +87,6 @@ class AsymmetricRULLoss(nn.Module):
 
     def forward(self, predictions_real: torch.Tensor, targets_real: torch.Tensor) -> torch.Tensor:
         targets_real = targets_real.view_as(predictions_real)
-        # Clamp denominator to avoid blowing up near RUL=0 (last few windows).
         denominator = torch.clamp(targets_real, min=1000.0)
         er = torch.clamp(
             100.0 * (targets_real - predictions_real) / denominator,
@@ -95,30 +95,77 @@ class AsymmetricRULLoss(nn.Module):
         ln_two = 0.69314718
         loss = torch.where(
             er <= 0,
-            ln_two * (-er) / self.over_scale,    # over-prediction
-            ln_two * er / self.under_scale,      # under-prediction
+            ln_two * (-er) / self.over_scale,
+            ln_two * er / self.under_scale,
         )
         return loss.mean()
 
 
-class CombinedRULLoss(nn.Module):
-    """RUL head loss: Huber(log) for stability + Asymmetric(real) for metric alignment."""
+class PairwiseRankingLoss(nn.Module):
+    """Monotonicity regularizer: pred_rul[i] > pred_rul[j] when true_rul[i] > true_rul[j].
 
-    def __init__(self, huber_weight: float = HUBER_WEIGHT,
-                 asymmetric_weight: float = ASYMMETRIC_WEIGHT):
+    Only enforces ordering for pairs whose true RUL differs by at least min_gap
+    in log space (~22% RUL difference at default 0.2), to avoid noise from
+    near-identical timesteps or different-case comparisons.
+    """
+
+    def __init__(self, margin: float = 0.05, min_gap: float = 0.2):
         super().__init__()
-        self.huber = nn.HuberLoss()
-        self.asymmetric = AsymmetricRULLoss()
-        self.huber_weight = huber_weight
-        self.asymmetric_weight = asymmetric_weight
+        self.margin = margin
+        self.min_gap = min_gap
 
     def forward(self, pred_log: torch.Tensor, target_log: torch.Tensor) -> torch.Tensor:
-        huber_loss = self.huber(pred_log, target_log)
-        pred_clamped = torch.clamp(pred_log, min=0.0, max=11.5)
-        pred_real = torch.expm1(pred_clamped)
-        target_real = torch.expm1(target_log)
-        asymmetric_loss = self.asymmetric(pred_real, target_real)
-        return self.huber_weight * huber_loss + self.asymmetric_weight * asymmetric_loss
+        pred   = pred_log.view(-1)
+        target = target_log.view(-1)
+        n = pred.size(0)
+        if n < 2:
+            return pred.sum() * 0.0
+
+        # All (i, j) pairs where target[i] > target[j] + min_gap
+        target_diff = target.unsqueeze(1) - target.unsqueeze(0)   # (n, n)
+        pred_diff   = pred.unsqueeze(1)   - pred.unsqueeze(0)     # (n, n)
+        mask = target_diff > self.min_gap
+        if not mask.any():
+            return pred.sum() * 0.0
+
+        # Hinge: penalize when pred[i] is not sufficiently larger than pred[j]
+        loss = torch.clamp(self.margin - pred_diff[mask], min=0.0)
+        return loss.mean()
+
+
+class TrainingLoss(nn.Module):
+    """L = 0.5*MSE(RUL_log) + 0.3*MSE(HI) + 0.2*PairwiseRanking.
+
+    Returns (total, l_rul, l_hi, l_rank) for per-component logging.
+    No asymmetric bias — predictions need no post-hoc DENORM correction.
+    """
+
+    def __init__(
+        self,
+        rul_weight:  float = RUL_LOSS_WEIGHT,
+        hi_weight:   float = HI_LOSS_WEIGHT,
+        rank_weight: float = RANKING_LOSS_WEIGHT,
+    ):
+        super().__init__()
+        self.rul_mse  = nn.MSELoss()
+        self.hi_mse   = nn.MSELoss()
+        self.ranking  = PairwiseRankingLoss()
+        self.rul_weight  = rul_weight
+        self.hi_weight   = hi_weight
+        self.rank_weight = rank_weight
+
+    def forward(
+        self,
+        pred_rul_log:    torch.Tensor,
+        pred_hi:         torch.Tensor,
+        target_rul_log:  torch.Tensor,
+        target_hi:       torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        l_rul  = self.rul_mse(pred_rul_log, target_rul_log)
+        l_hi   = self.hi_mse(pred_hi, target_hi)
+        l_rank = self.ranking(pred_rul_log, target_rul_log)
+        total  = self.rul_weight * l_rul + self.hi_weight * l_hi + self.rank_weight * l_rank
+        return total, l_rul, l_hi, l_rank
 
 
 def asymmetric_rul_score_np(predictions, targets) -> np.ndarray:

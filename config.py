@@ -37,9 +37,11 @@ VIBRATION_CHANNELS = ("CH1", "CH2", "CH3", "CH4")
 
 
 # Handcrafted features --------------------------------------------------------
-# Only RPM-INDEPENDENT features. The 10 RPM-dependent ones (BPFO/BPFI/BSF/FTF,
-# F_1X..F_3456X) were dropped after the RPM ablation showed RPM was not a
-# usable signal and inferred-RPM features just added noise.
+# 10 RPM-independent statistics + 6 bearing fault frequency amplitudes.
+# Fault freq amplitudes are computed from each chunk's own FFT-estimated RPM
+# (not the operation CSV), so they are accurately aligned per 10-second chunk.
+# Previous RPM ablation failed because it used the operation CSV motor_speed_rpm
+# which has coarse temporal resolution and per-chunk misalignment.
 HANDCRAFTED_FEATURES = (
     "RMS",
     "PEAK_TO_PEAK",
@@ -51,6 +53,13 @@ HANDCRAFTED_FEATURES = (
     "SHAPE",
     "ABS_MAX",
     "RMS_HIGH",
+    # Bearing fault frequency spectral amplitudes (RPM estimated per chunk)
+    "BPFI_1X",
+    "BPFI_2X",
+    "BPFO_1X",
+    "BPFO_2X",
+    "BSF_1X",
+    "FTF_1X",
 )
 HANDCRAFTED_DIM = len(HANDCRAFTED_FEATURES)
 DEGRADATION_BASELINE_TIMESTEPS = 10                # first N timesteps used as healthy baseline
@@ -71,6 +80,18 @@ HI_LABEL_MODE = "hybrid"
 HI_LABEL_POWER = 2.0
 HI_DAMAGE_SCALE = 5.0        # RMS growth ratio that maps to HI=1.0 (tanh saturation)
 HI_FAILURE_THRESHOLD = 0.9   # HI value treated as end-of-life in stage 2
+
+
+# Bearing fault frequency multipliers — 30306 tapered roller bearing
+# Reference: spec sheet at 1000 RPM → BPFI=140Hz, BPFO=93Hz, BSF=78Hz, FTF=6.7Hz
+# mult = freq_hz / (1000/60).  At any RPM: fault_hz = MULT * RPM/60.
+BEARING_BPFI_MULT = 8.40    # 140 / 16.667
+BEARING_BPFO_MULT = 5.58    # 93  / 16.667
+BEARING_BSF_MULT  = 4.68    # 78  / 16.667
+BEARING_FTF_MULT  = 0.402   # 6.7 / 16.667
+BEARING_RPM_MIN     = 600.0
+BEARING_RPM_MAX     = 1_100.0
+BEARING_RPM_DEFAULT = 800.0  # fallback when chunk is too short for RPM estimation
 
 
 # STFT ------------------------------------------------------------------------
@@ -107,35 +128,27 @@ EARLY_STOPPING_PATIENCE = 8
 # Validation holdout (single-fold leave-one-TDMS-case-out).
 RANDOM_VAL_CASE = True
 VAL_CASE_DEFAULT = "Train2"
-VAL_CASE_SEED = None
+VAL_CASE_SEED = 42
 
 
 # Loss ------------------------------------------------------------------------
-# Phase 1 hybrid: the model has two heads sharing one encoder.
-#   - RUL head:  log-space regression, trained with Huber(log) + Asymmetric(real).
-#                This is the production output -- it directly matches the
-#                competition metric (which heavily rewards conservative
-#                under-prediction) so we let it learn that bias.
-#   - HI head:   sigmoid in [0, 1], trained with MSE on the hybrid HI label.
-#                Acts as an auxiliary task -- forces the shared encoder to learn
-#                degradation trajectory features (which a pure RUL head, on tiny
-#                data, can ignore by falling into safe-low collapse).
+# Training loss = 0.5*MSE(RUL_log) + 0.3*MSE(HI) + 0.2*PairwiseRanking
+#   - RUL MSE (log space): unbiased regression — no asymmetric bias, no DENORM hack.
+#   - HI MSE: auxiliary degradation supervision.
+#   - PairwiseRanking: enforces pred_rul[i] > pred_rul[j] when true_rul[i] > true_rul[j].
 #
-# Total loss = RUL_LOSS_WEIGHT * RUL_loss + HI_LOSS_WEIGHT * HI_loss.
-RUL_LOSS_WEIGHT = 0.7
-HI_LOSS_WEIGHT = 0.3
+# Asymmetric metric (A_RUL) is used ONLY in validation reporting, not in training.
+RUL_LOSS_WEIGHT     = 0.5
+HI_LOSS_WEIGHT      = 0.3
+RANKING_LOSS_WEIGHT = 0.2
 
-# Internal RUL loss = HUBER_WEIGHT * Huber(log) + ASYMMETRIC_WEIGHT * Asymmetric(real).
-HUBER_WEIGHT = 0.15
-ASYMMETRIC_WEIGHT = 0.85
-OVER_EST_PENALTY_SCALE = 20.0
+# A_RUL evaluation penalty scales — evaluation only, not used in training loss.
+OVER_EST_PENALTY_SCALE  = 20.0
 UNDER_EST_PENALTY_SCALE = 50.0
 
-# Post-inference scale applied to raw RUL seconds: pred_final = pred_raw * DENORM_SCALE.
-# Tuned on OOF parquets from seed42 full-CV: raw preds are systematically low
-# (model under-predicts due to asymmetric loss bias), so scale > 1.0 recovers signal.
-# OOF sweep (30-dim relative features, seed42): 1.0→0.4215, 1.80→0.4673 (peak). Set to 1.80.
-DENORM_SCALE = 1.80
+# DENORM_SCALE is retired (was a post-hoc bias correction for the old asymmetric loss).
+# Kept at 1.0 so existing checkpoint-loading code that reads 'denorm_scale' still works.
+DENORM_SCALE = 1.0
 
 
 # Runtime ---------------------------------------------------------------------

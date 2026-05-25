@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, Iterable
 
 import numpy as np
-from scipy.signal import stft
+from scipy.signal import find_peaks, stft
 
 # 직접 실행하거나 패키지 외부에서 임포트할 때 프로젝트 루트를 sys.path에 추가
 _project_root = Path(__file__).resolve().parent.parent
@@ -17,6 +17,13 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from config import (
+    BEARING_BPFI_MULT,
+    BEARING_BPFO_MULT,
+    BEARING_BSF_MULT,
+    BEARING_FTF_MULT,
+    BEARING_RPM_DEFAULT,
+    BEARING_RPM_MAX,
+    BEARING_RPM_MIN,
     SAMPLING_RATE,
     STFT_FREQ_BINS,
     STFT_NOVERLAP,
@@ -83,6 +90,121 @@ def stft_magnitude_vector(signal: Iterable[float]) -> np.ndarray:
     freq_std  = _pad_or_trim(np.std(magnitude,  axis=1), STFT_FREQ_BINS)
 
     return np.concatenate([freq_mean, freq_std]).astype(np.float32)
+
+
+def _full_rfft(signal: np.ndarray, sampling_rate: int) -> tuple[np.ndarray, np.ndarray]:
+    """Full-length one-sided FFT → (freqs, amplitude). Removes DC, no window needed for peak detection."""
+    arr = np.asarray(signal, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size < 4:
+        return np.array([0.0]), np.array([0.0])
+    arr = arr - arr.mean()
+    spectrum = np.abs(np.fft.rfft(arr))
+    freqs = np.fft.rfftfreq(arr.size, d=1.0 / sampling_rate)
+    return freqs, spectrum
+
+
+def _spectral_peak_in_band(
+    freqs: np.ndarray,
+    spectrum: np.ndarray,
+    target_hz: float,
+    bandwidth_hz: float = 2.0,
+) -> float:
+    """Max spectral amplitude in [target - bw/2, target + bw/2], normalized by N."""
+    if target_hz <= 0 or target_hz > freqs[-1]:
+        return 0.0
+    lo = target_hz - bandwidth_hz / 2.0
+    hi = target_hz + bandwidth_hz / 2.0
+    mask = (freqs >= lo) & (freqs <= hi)
+    if not np.any(mask):
+        idx = int(np.argmin(np.abs(freqs - target_hz)))
+        return float(spectrum[idx])
+    return float(np.max(spectrum[mask]))
+
+
+def estimate_shaft_freq_hz(
+    signal: np.ndarray,
+    sampling_rate: int = SAMPLING_RATE,
+    min_rpm: float = BEARING_RPM_MIN,
+    max_rpm: float = BEARING_RPM_MAX,
+    default_rpm: float = BEARING_RPM_DEFAULT,
+) -> float:
+    """Estimate shaft (1×) frequency in Hz from vibration spectrum using harmonic peak scoring.
+
+    Mirrors estimationRPM.estimate_rpm_from_spectrum but operates on a single
+    pre-read signal array and returns Hz (not RPM). Falls back to default_rpm
+    when the signal is too short or no plausible peak is found.
+    """
+    freqs, spectrum = _full_rfft(signal, sampling_rate)
+    if freqs.size < 2:
+        return default_rpm / 60.0
+
+    min_hz, max_hz = min_rpm / 60.0, max_rpm / 60.0
+    mask = (freqs >= min_hz) & (freqs <= max_hz)
+    candidate_freqs = freqs[mask]
+    search_spectrum = spectrum[mask]
+
+    if candidate_freqs.size == 0:
+        return default_rpm / 60.0
+
+    peak_indices, _ = find_peaks(search_spectrum)
+    if peak_indices.size == 0:
+        peak_indices = np.arange(candidate_freqs.size)
+
+    best_freq = float(candidate_freqs[peak_indices[0]])
+    best_score = -np.inf
+    for pi in peak_indices:
+        f = float(candidate_freqs[pi])
+        score = (
+            _spectral_peak_in_band(freqs, spectrum, f)
+            + 0.5 * _spectral_peak_in_band(freqs, spectrum, 2.0 * f)
+            + 0.25 * _spectral_peak_in_band(freqs, spectrum, 3.0 * f)
+        )
+        if score > best_score:
+            best_score = score
+            best_freq = f
+
+    return best_freq
+
+
+def bearing_fault_amplitudes(
+    signal: np.ndarray,
+    sampling_rate: int = SAMPLING_RATE,
+) -> np.ndarray:
+    """Estimate shaft RPM from signal FFT, compute bearing fault frequencies, return spectral amplitudes.
+
+    30306 bearing multipliers: BPFI=8.40×, BPFO=5.58×, BSF=4.68×, FTF=0.402× shaft freq.
+
+    Returns 6-dim float32: [BPFI_1X, BPFI_2X, BPFO_1X, BPFO_2X, BSF_1X, FTF_1X]
+    Amplitudes are divided by signal length so different chunk sizes give comparable values.
+    """
+    arr = np.asarray(signal, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+
+    # Need at least 1 second to resolve shaft frequency (min ~10 Hz at 600 RPM)
+    if arr.size < sampling_rate:
+        shaft_hz = BEARING_RPM_DEFAULT / 60.0
+    else:
+        shaft_hz = estimate_shaft_freq_hz(arr, sampling_rate)
+
+    freqs, spectrum = _full_rfft(arr, sampling_rate)
+    n = max(arr.size, 1)
+    spectrum = spectrum / n  # normalize by signal length
+
+    bpfi = BEARING_BPFI_MULT * shaft_hz
+    bpfo = BEARING_BPFO_MULT * shaft_hz
+    bsf  = BEARING_BSF_MULT  * shaft_hz
+    ftf  = BEARING_FTF_MULT  * shaft_hz
+
+    def amp(f_hz: float) -> float:
+        return _spectral_peak_in_band(freqs, spectrum, f_hz)
+
+    return np.array([
+        amp(bpfi), amp(2.0 * bpfi),
+        amp(bpfo), amp(2.0 * bpfo),
+        amp(bsf),
+        amp(ftf),
+    ], dtype=np.float32)
 
 
 def augment_stft_features(stft_matrix: np.ndarray, aug_prob: float = 0.3) -> np.ndarray:

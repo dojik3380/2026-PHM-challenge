@@ -48,7 +48,7 @@ from config import (
     VIBRATION_FEATURES_PER_CHANNEL,
 )
 from features.degradation import augment_with_degradation, compute_global_baseline
-from features.vibration import stft_magnitude_vector
+from features.vibration import bearing_fault_amplitudes, stft_magnitude_vector
 
 
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "cp949")
@@ -198,7 +198,7 @@ def _amplitude_band(signal: np.ndarray, low: float, high: float) -> float:
 
 
 def handcrafted_features_from_signal(signal: Iterable[float]) -> np.ndarray:
-    """Compute 10 RPM-independent statistics from a raw vibration chunk."""
+    """Compute 10 RPM-independent statistics + 6 bearing fault frequency amplitudes."""
     arr = np.asarray(signal, dtype=np.float32)
     arr = arr[np.isfinite(arr)]
     out = np.zeros(HANDCRAFTED_DIM, dtype=np.float32)
@@ -229,6 +229,12 @@ def handcrafted_features_from_signal(signal: Iterable[float]) -> np.ndarray:
     }
     for name, value in values.items():
         out[FEATURE_INDEX[name]] = _safe_float(value)
+
+    # Bearing fault frequency amplitudes: RPM estimated from this chunk's own FFT
+    fault_amps = bearing_fault_amplitudes(arr.astype(np.float64), SAMPLING_RATE)
+    for i, name in enumerate(("BPFI_1X", "BPFI_2X", "BPFO_1X", "BPFO_2X", "BSF_1X", "FTF_1X")):
+        out[FEATURE_INDEX[name]] = _safe_float(fault_amps[i])
+
     return out
 
 
@@ -300,7 +306,7 @@ def compute_hi_labels(
 # ============================================================================
 
 
-CACHE_VERSION = "v7_hi"
+CACHE_VERSION = "v8_faultfreq"
 
 
 def _cache_key(paths: Iterable[Path], extra: str) -> str:

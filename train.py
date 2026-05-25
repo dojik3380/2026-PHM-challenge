@@ -1,11 +1,8 @@
 """Train DualHeadModel (RUL + HI) with leave-one-TDMS-case-out CV.
 
-Loss = RUL_LOSS_WEIGHT * (Huber(log) + Asymmetric(real))   # production target
-     + HI_LOSS_WEIGHT  * MSE(HI)                            # auxiliary supervision
-
-The RUL head is the production output. The HI head is auxiliary -- it forces
-the shared encoder to learn degradation trajectory features that a pure RUL
-head, on tiny data, can ignore by falling into safe-low collapse.
+Training loss = 0.5*MSE(RUL_log) + 0.3*MSE(HI) + 0.2*PairwiseRanking
+  - No asymmetric bias → no DENORM_SCALE post-hoc correction needed.
+  - A_RUL (asymmetric metric) is reported at validation time only.
 """
 
 from __future__ import annotations
@@ -22,15 +19,12 @@ from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 from config import (
     BATCH_SIZE,
     DATA2_DIR,
-    DENORM_SCALE,
     DEVICE,
     EARLY_STOPPING_PATIENCE,
     EPOCHS,
-    HI_LOSS_WEIGHT,
     LEARNING_RATE,
     MODELS_DIR,
     RANDOM_VAL_CASE,
-    RUL_LOSS_WEIGHT,
     SCHEDULER_T0,
     STFT_FREQ_BINS,
     STFT_NOVERLAP,
@@ -43,7 +37,7 @@ from config import (
     WINDOW_SIZE,
 )
 from data_loader import load_dataset
-from model import CombinedRULLoss, asymmetric_rul_score_np, create_model
+from model import TrainingLoss, asymmetric_rul_score_np, create_model
 
 
 MODEL_PATH = MODELS_DIR / "RUL.pt"
@@ -108,8 +102,8 @@ def train(
         print(f"[seed] all RNGs set to {seed}")
 
     print("=" * 72)
-    print(f"Dual-head (RUL + HI aux) training | seed={seed} | window={window_size} stride={stride}")
-    print(f"  loss weights: RUL={RUL_LOSS_WEIGHT}  HI={HI_LOSS_WEIGHT}  | DENORM_SCALE={DENORM_SCALE}")
+    print(f"Dual-head training | seed={seed} | window={window_size} stride={stride}")
+    print(f"  loss: 0.5*MSE(RUL_log) + 0.3*MSE(HI) + 0.2*PairwiseRanking")
     print("=" * 72)
 
     X_vib, X_feat, hi, rul, metadata, baseline = load_dataset(
@@ -195,8 +189,7 @@ def train(
             vibration_features=X_vib.shape[3],
             handcrafted_dim=X_feat.shape[-1],
         ).to(device)
-        rul_criterion = CombinedRULLoss()
-        hi_criterion = nn.MSELoss()
+        criterion = TrainingLoss()
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=WEIGHT_DECAY)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=SCHEDULER_T0, T_mult=2)
 
@@ -205,38 +198,38 @@ def train(
         patience = 0
         for epoch in range(1, epochs + 1):
             model.train()
-            tr_rul = tr_hi = tr_tot = 0.0
+            tr_rul = tr_hi = tr_rank = tr_tot = 0.0
             for bv, bf, by_rul, by_hi in train_loader:
                 bv, bf = bv.to(device), bf.to(device)
                 by_rul, by_hi = by_rul.to(device), by_hi.to(device)
                 optimizer.zero_grad()
                 pred_rul, pred_hi = model(bv, bf)
-                l_rul = rul_criterion(pred_rul, by_rul)
-                l_hi = hi_criterion(pred_hi, by_hi)
-                loss = RUL_LOSS_WEIGHT * l_rul + HI_LOSS_WEIGHT * l_hi
+                loss, l_rul, l_hi, l_rank = criterion(pred_rul, pred_hi, by_rul, by_hi)
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-                tr_rul += l_rul.item() * by_rul.size(0)
-                tr_hi += l_hi.item() * by_rul.size(0)
-                tr_tot += loss.item() * by_rul.size(0)
+                n = by_rul.size(0)
+                tr_rul += l_rul.item() * n
+                tr_hi += l_hi.item() * n
+                tr_rank += l_rank.item() * n
+                tr_tot += loss.item() * n
 
             model.eval()
-            va_rul = va_hi = va_tot = 0.0
+            va_rul = va_hi = va_rank = va_tot = 0.0
             with torch.no_grad():
                 for bv, bf, by_rul, by_hi in val_loader:
                     bv, bf = bv.to(device), bf.to(device)
                     by_rul, by_hi = by_rul.to(device), by_hi.to(device)
                     pred_rul, pred_hi = model(bv, bf)
-                    l_rul = rul_criterion(pred_rul, by_rul)
-                    l_hi = hi_criterion(pred_hi, by_hi)
-                    loss = RUL_LOSS_WEIGHT * l_rul + HI_LOSS_WEIGHT * l_hi
-                    va_rul += l_rul.item() * by_rul.size(0)
-                    va_hi += l_hi.item() * by_rul.size(0)
-                    va_tot += loss.item() * by_rul.size(0)
+                    loss, l_rul, l_hi, l_rank = criterion(pred_rul, pred_hi, by_rul, by_hi)
+                    n = by_rul.size(0)
+                    va_rul += l_rul.item() * n
+                    va_hi += l_hi.item() * n
+                    va_rank += l_rank.item() * n
+                    va_tot += loss.item() * n
             n_tr, n_va = len(train_loader.dataset), len(val_loader.dataset)
-            tr_rul /= n_tr; tr_hi /= n_tr; tr_tot /= n_tr
-            va_rul /= n_va; va_hi /= n_va; va_tot /= n_va
+            tr_rul /= n_tr; tr_hi /= n_tr; tr_rank /= n_tr; tr_tot /= n_tr
+            va_rul /= n_va; va_hi /= n_va; va_rank /= n_va; va_tot /= n_va
             scheduler.step()
 
             if va_tot < best_val:
@@ -250,8 +243,8 @@ def train(
                     break
             if epoch % 5 == 0 or epoch == 1:
                 print(f"  epoch {epoch:03d}/{epochs} | "
-                      f"tr(rul={tr_rul:.4f} hi={tr_hi:.4f} tot={tr_tot:.4f}) "
-                      f"va(rul={va_rul:.4f} hi={va_hi:.4f} tot={va_tot:.4f}) "
+                      f"tr(rul={tr_rul:.4f} hi={tr_hi:.4f} rank={tr_rank:.4f} tot={tr_tot:.4f}) "
+                      f"va(rul={va_rul:.4f} hi={va_hi:.4f} rank={va_rank:.4f} tot={va_tot:.4f}) "
                       f"patience={patience}")
 
         if best_state is not None:
@@ -268,21 +261,19 @@ def train(
         rul_log_preds = np.concatenate(rul_log_preds).astype(np.float64)
         hi_preds = np.concatenate(hi_preds).astype(np.float64)
 
-        # RUL head -> seconds, then conservative shrinkage.
-        rul_pred_raw = np.expm1(np.clip(rul_log_preds, 0.0, 11.5))
-        rul_pred = np.maximum(rul_pred_raw * DENORM_SCALE, 0.0)
+        # RUL head: log → seconds (no post-hoc scaling).
+        rul_pred = np.maximum(np.expm1(np.clip(rul_log_preds, 0.0, 11.5)), 0.0)
         true_rul = rul[val_idx].astype(np.float64)
         true_hi = hi[val_idx].astype(np.float64)
 
-        arul_raw = _arul(rul_pred_raw, true_rul)
         arul = _arul(rul_pred, true_rul)
         rul_mae = float(np.mean(np.abs(rul_pred - true_rul)))
         hi_mae = float(np.mean(np.abs(hi_preds - true_hi)))
         print("\nValidation:")
-        print(f"  RUL  MAE={rul_mae:7.0f}  A_RUL raw={arul_raw:.4f}  A_RUL (xDENORM_SCALE={DENORM_SCALE})={arul:.4f}")
+        print(f"  RUL  MAE={rul_mae:7.0f}  A_RUL={arul:.4f}")
         print(f"  HI   MAE={hi_mae:.4f}  (auxiliary head)")
         fold_summaries.append({"fold": fold, "held_out": held_out,
-                               "rul_mae": rul_mae, "a_rul": arul, "a_rul_raw": arul_raw,
+                               "rul_mae": rul_mae, "a_rul": arul,
                                "hi_mae": hi_mae})
 
         seed_tag = f"_seed{seed}" if seed is not None else ""
@@ -304,7 +295,7 @@ def train(
                 "feature_mean": feat_mean,
                 "feature_std": feat_std,
                 "degradation_baseline": baseline,
-                "denorm_scale": DENORM_SCALE,
+                "denorm_scale": 1.0,
                 "fold_summary": fold_summaries[-1],
                 "seed": seed,
             },
@@ -317,8 +308,7 @@ def train(
         val_meta = metadata.iloc[val_idx].reset_index(drop=True)
         oof_df = val_meta.copy()
         oof_df["rul_true"] = true_rul
-        oof_df["rul_pred_raw"] = rul_pred_raw            # no shrinkage
-        oof_df["rul_pred"] = rul_pred                    # with DENORM_SCALE (production)
+        oof_df["rul_pred"] = rul_pred
         oof_df["hi_true"] = true_hi
         oof_df["hi_pred"] = hi_preds
         oof_df["fold"] = fold
@@ -334,15 +324,12 @@ def train(
     print("\nFold summary:")
     for s in fold_summaries:
         print(f"  fold {s['fold']:>2} ({s['held_out']:>10}): "
-              f"RUL_MAE={s['rul_mae']:7.0f}  A_RUL={s['a_rul']:.4f}  (raw={s['a_rul_raw']:.4f})  "
-              f"HI_MAE={s['hi_mae']:.4f}")
+              f"RUL_MAE={s['rul_mae']:7.0f}  A_RUL={s['a_rul']:.4f}  HI_MAE={s['hi_mae']:.4f}")
     if len(fold_summaries) > 1:
         avg_arul = np.mean([s["a_rul"] for s in fold_summaries])
-        avg_arul_raw = np.mean([s["a_rul_raw"] for s in fold_summaries])
         avg_rul_mae = np.mean([s["rul_mae"] for s in fold_summaries])
         avg_hi_mae = np.mean([s["hi_mae"] for s in fold_summaries])
-        print(f"  AVERAGE: A_RUL={avg_arul:.4f}  (raw={avg_arul_raw:.4f})  "
-              f"RUL_MAE={avg_rul_mae:.0f}  HI_MAE={avg_hi_mae:.4f}")
+        print(f"  AVERAGE: A_RUL={avg_arul:.4f}  RUL_MAE={avg_rul_mae:.0f}  HI_MAE={avg_hi_mae:.4f}")
     return saved
 
 
