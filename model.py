@@ -17,6 +17,7 @@ Inference uses the RUL head only. HI head exists solely as a supervision aid.
 """
 
 import math
+from typing import Optional
 
 import numpy as np
 import torch
@@ -104,9 +105,9 @@ class AsymmetricRULLoss(nn.Module):
 class PairwiseRankingLoss(nn.Module):
     """Monotonicity regularizer: pred_rul[i] > pred_rul[j] when true_rul[i] > true_rul[j].
 
-    Only enforces ordering for pairs whose true RUL differs by at least min_gap
-    in log space (~22% RUL difference at default 0.2), to avoid noise from
-    near-identical timesteps or different-case comparisons.
+    When case_ids is provided, only within-case pairs are used — this enforces
+    "earlier window → higher RUL" without noisy cross-case comparisons.
+    min_gap=0.2 in log space ≈ 22% RUL difference; filters near-identical windows.
     """
 
     def __init__(self, margin: float = 0.05, min_gap: float = 0.2):
@@ -114,30 +115,63 @@ class PairwiseRankingLoss(nn.Module):
         self.margin = margin
         self.min_gap = min_gap
 
-    def forward(self, pred_log: torch.Tensor, target_log: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        pred_log: torch.Tensor,
+        target_log: torch.Tensor,
+        case_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         pred   = pred_log.view(-1)
         target = target_log.view(-1)
         n = pred.size(0)
         if n < 2:
             return pred.sum() * 0.0
 
-        # All (i, j) pairs where target[i] > target[j] + min_gap
         target_diff = target.unsqueeze(1) - target.unsqueeze(0)   # (n, n)
         pred_diff   = pred.unsqueeze(1)   - pred.unsqueeze(0)     # (n, n)
         mask = target_diff > self.min_gap
+
+        if case_ids is not None:
+            same_case = case_ids.view(-1, 1) == case_ids.view(1, -1)
+            mask = mask & same_case
+
         if not mask.any():
             return pred.sum() * 0.0
 
-        # Hinge: penalize when pred[i] is not sufficiently larger than pred[j]
         loss = torch.clamp(self.margin - pred_diff[mask], min=0.0)
         return loss.mean()
 
 
-class TrainingLoss(nn.Module):
-    """L = 0.5*MSE(RUL_log) + 0.3*MSE(HI) + 0.2*PairwiseRanking.
+class SoftAsymmetricLogLoss(nn.Module):
+    """Weighted MSE in log-space: over-prediction penalized over_scale× harder.
 
+    pred_log > target_log  →  pred_real > target_real  →  over-prediction.
+    Using log-space residuals keeps gradient magnitudes bounded (unlike real-space
+    which explodes for large RUL values) while still biasing the model toward
+    conservative under-prediction to match the competition's asymmetric penalty.
+    """
+
+    def __init__(self, over_scale: float = 2.5):
+        super().__init__()
+        self.over_scale = over_scale
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        diff = pred.view(-1) - target.view(-1)
+        weight = torch.where(diff > 0,
+                             torch.full_like(diff, self.over_scale),
+                             torch.ones_like(diff))
+        return (weight * diff.pow(2)).mean()
+
+
+class TrainingLoss(nn.Module):
+    """L = 0.70*Huber(RUL_log) + 0.20*MSE(HI) + 0.10*PairwiseRanking
+
+    Pure Huber for RUL: unbiased regression in log-space. SoftAsymmetricLogLoss
+    was removed because over_scale=2.5 caused systematic 35% under-prediction in
+    early life, lowering A_RUL significantly (under-prediction is also penalized
+    by the competition metric). Asymmetric calibration is applied post-hoc via
+    CALIBRATION_SHRINK if needed.
     Returns (total, l_rul, l_hi, l_rank) for per-component logging.
-    No asymmetric bias — predictions need no post-hoc DENORM correction.
     """
 
     def __init__(
@@ -147,23 +181,24 @@ class TrainingLoss(nn.Module):
         rank_weight: float = RANKING_LOSS_WEIGHT,
     ):
         super().__init__()
-        self.rul_mse  = nn.MSELoss()
-        self.hi_mse   = nn.MSELoss()
-        self.ranking  = PairwiseRankingLoss()
+        self.rul_huber = nn.HuberLoss(delta=1.0)
+        self.hi_loss   = nn.MSELoss()
+        self.ranking   = PairwiseRankingLoss()
         self.rul_weight  = rul_weight
         self.hi_weight   = hi_weight
         self.rank_weight = rank_weight
 
     def forward(
         self,
-        pred_rul_log:    torch.Tensor,
-        pred_hi:         torch.Tensor,
-        target_rul_log:  torch.Tensor,
-        target_hi:       torch.Tensor,
+        pred_rul_log:   torch.Tensor,
+        pred_hi:        torch.Tensor,
+        target_rul_log: torch.Tensor,
+        target_hi:      torch.Tensor,
+        case_ids:       Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        l_rul  = self.rul_mse(pred_rul_log, target_rul_log)
-        l_hi   = self.hi_mse(pred_hi, target_hi)
-        l_rank = self.ranking(pred_rul_log, target_rul_log)
+        l_rul  = self.rul_huber(pred_rul_log, target_rul_log)
+        l_hi   = self.hi_loss(pred_hi, target_hi)
+        l_rank = self.ranking(pred_rul_log, target_rul_log, case_ids)
         total  = self.rul_weight * l_rul + self.hi_weight * l_hi + self.rank_weight * l_rank
         return total, l_rul, l_hi, l_rank
 

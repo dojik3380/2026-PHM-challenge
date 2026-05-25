@@ -207,6 +207,37 @@ def bearing_fault_amplitudes(
     ], dtype=np.float32)
 
 
+def shaft_harmonic_amplitudes(
+    signal: np.ndarray,
+    sampling_rate: int = SAMPLING_RATE,
+) -> np.ndarray:
+    """Order-domain shaft harmonic energy: [SHAFT_1X, SHAFT_2X, SHAFT_3X].
+
+    Shaft frequency is estimated from the vibration FFT (not from operation CSV),
+    so the result is RPM-invariant — the same order content maps to the same
+    amplitude regardless of operating speed.  Spectrum normalized by N so
+    different chunk sizes give comparable values.
+
+    Returns 3-dim float32.
+    """
+    arr = np.asarray(signal, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+
+    if arr.size < sampling_rate:
+        shaft_hz = BEARING_RPM_DEFAULT / 60.0
+    else:
+        shaft_hz = estimate_shaft_freq_hz(arr, sampling_rate)
+
+    freqs, spectrum = _full_rfft(arr, sampling_rate)
+    n = max(arr.size, 1)
+    spectrum = spectrum / n
+
+    def amp(f_hz: float) -> float:
+        return _spectral_peak_in_band(freqs, spectrum, f_hz)
+
+    return np.array([amp(shaft_hz), amp(2.0 * shaft_hz), amp(3.0 * shaft_hz)], dtype=np.float32)
+
+
 def augment_stft_features(stft_matrix: np.ndarray, aug_prob: float = 0.3) -> np.ndarray:
     """STFT 특징에 노이즈 억제 중심 증강 적용 (대회 특성 고려)"""
     augmented = stft_matrix.copy()

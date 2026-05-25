@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from config import DENORM_SCALE, DEVICE, RESULTS_DIR, TEAM_NAME, TEST_DIR, WINDOW_SIZE
+from config import CALIBRATION_SHRINK, DENORM_SCALE, DEVICE, RESULTS_DIR, TEAM_NAME, TEST_DIR, WINDOW_SIZE
 from data_loader import load_inference_dataset
 from model import create_model
 from train import MODEL_PATH
@@ -122,9 +122,9 @@ def evaluate_test(
     # Ensemble in log space, then expm1, then DENORM_SCALE shrinkage.
     rul_log_ens = np.mean(np.stack(fold_rul_log, axis=0), axis=0)
     rul_seconds = np.expm1(np.clip(rul_log_ens, 0.0, 11.5))
-    rul_final = np.maximum(rul_seconds * DENORM_SCALE, 0.0)
+    rul_final = np.maximum(rul_seconds * CALIBRATION_SHRINK, 0.0)
     hi_ens = np.mean(np.stack(fold_hi, axis=0), axis=0)
-    print(f"\n[ensemble] RUL mean={rul_seconds.mean():.0f}  after DENORM_SCALE({DENORM_SCALE})={rul_final.mean():.0f}")
+    print(f"\n[ensemble] RUL mean={rul_seconds.mean():.0f}  after CALIBRATION_SHRINK({CALIBRATION_SHRINK})={rul_final.mean():.0f}")
 
     # Report RUL at the LAST window per case.
     results = []

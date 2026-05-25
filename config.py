@@ -53,13 +53,18 @@ HANDCRAFTED_FEATURES = (
     "SHAPE",
     "ABS_MAX",
     "RMS_HIGH",
-    # Bearing fault frequency spectral amplitudes (RPM estimated per chunk)
+    # Bearing fault frequency amplitudes (RPM estimated per chunk via FFT)
     "BPFI_1X",
     "BPFI_2X",
     "BPFO_1X",
     "BPFO_2X",
     "BSF_1X",
     "FTF_1X",
+    # Shaft harmonic order energy (1×/2×/3× shaft frequency)
+    # Order-domain normalization: freq_hz = mult × shaft_hz, RPM-invariant
+    "SHAFT_1X",
+    "SHAFT_2X",
+    "SHAFT_3X",
 )
 HANDCRAFTED_DIM = len(HANDCRAFTED_FEATURES)
 DEGRADATION_BASELINE_TIMESTEPS = 10                # first N timesteps used as healthy baseline
@@ -76,10 +81,11 @@ AUGMENTED_HANDCRAFTED_DIM = HANDCRAFTED_DIM * 3 if HI_FEATURES_ENABLED else HAND
 #              short/long-lifetime outlier problem (Train3 / Train4) that
 #              time-based labels suffer from.
 #   "hybrid" : 0.5 * linear + 0.5 * damage                (best of both)
-HI_LABEL_MODE = "hybrid"
+HI_LABEL_MODE = "composite"
 HI_LABEL_POWER = 2.0
 HI_DAMAGE_SCALE = 5.0        # RMS growth ratio that maps to HI=1.0 (tanh saturation)
 HI_FAILURE_THRESHOLD = 0.9   # HI value treated as end-of-life in stage 2
+HI_SMOOTH_WINDOW = 11        # moving-average window for cumulative-damage HI smoothing
 
 
 # Bearing fault frequency multipliers — 30306 tapered roller bearing
@@ -116,19 +122,19 @@ TDMS_CHUNKS_PER_FILE = 6                             # 60 s TDMS file -> 6 chunk
 # windows enough to avoid trivial memorization and is 4x faster to train.
 WINDOW_SIZE = 32
 STRIDE = 4
-EPOCHS = 25
+EPOCHS = 35
 BATCH_SIZE = 32
-LEARNING_RATE = 5e-4
+LEARNING_RATE = 2e-4
 DROPOUT = 0.5
 WEIGHT_DECAY = 1e-4
 VIB_HIDDEN = 64
 SCHEDULER_T0 = 12
-EARLY_STOPPING_PATIENCE = 8
+EARLY_STOPPING_PATIENCE = 12
 
 # Validation holdout (single-fold leave-one-TDMS-case-out).
 RANDOM_VAL_CASE = True
 VAL_CASE_DEFAULT = "Train2"
-VAL_CASE_SEED = 42
+VAL_CASE_SEED = None   # None → truly random each run; set an int for reproducibility
 
 
 # Loss ------------------------------------------------------------------------
@@ -138,17 +144,20 @@ VAL_CASE_SEED = 42
 #   - PairwiseRanking: enforces pred_rul[i] > pred_rul[j] when true_rul[i] > true_rul[j].
 #
 # Asymmetric metric (A_RUL) is used ONLY in validation reporting, not in training.
-RUL_LOSS_WEIGHT     = 0.5
-HI_LOSS_WEIGHT      = 0.3
-RANKING_LOSS_WEIGHT = 0.2
+RUL_LOSS_WEIGHT     = 0.50
+HI_LOSS_WEIGHT      = 0.40
+RANKING_LOSS_WEIGHT = 0.10
 
 # A_RUL evaluation penalty scales — evaluation only, not used in training loss.
 OVER_EST_PENALTY_SCALE  = 20.0
 UNDER_EST_PENALTY_SCALE = 50.0
 
-# DENORM_SCALE is retired (was a post-hoc bias correction for the old asymmetric loss).
-# Kept at 1.0 so existing checkpoint-loading code that reads 'denorm_scale' still works.
+# DENORM_SCALE is retired. Kept at 1.0 so existing checkpoints still load.
 DENORM_SCALE = 1.0
+
+# Post-hoc conservative calibration at inference (multiply final RUL by this).
+# 1.0 = neutral. Tune on OOF: sweep [0.6, 1.0] and pick α that maximises A_RUL.
+CALIBRATION_SHRINK = 1.0
 
 
 # Runtime ---------------------------------------------------------------------

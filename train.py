@@ -8,8 +8,11 @@ Training loss = 0.5*MSE(RUL_log) + 0.3*MSE(HI) + 0.2*PairwiseRanking
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Optional
+
+sys.stdout.reconfigure(line_buffering=True)  # flush every line when redirected to file
 
 import numpy as np
 import torch
@@ -22,9 +25,13 @@ from config import (
     DEVICE,
     EARLY_STOPPING_PATIENCE,
     EPOCHS,
+    HI_LOSS_WEIGHT,
     LEARNING_RATE,
     MODELS_DIR,
     RANDOM_VAL_CASE,
+    RANKING_LOSS_WEIGHT,
+    RESULTS_DIR,
+    RUL_LOSS_WEIGHT,
     SCHEDULER_T0,
     STFT_FREQ_BINS,
     STFT_NOVERLAP,
@@ -41,6 +48,80 @@ from model import TrainingLoss, asymmetric_rul_score_np, create_model
 
 
 MODEL_PATH = MODELS_DIR / "RUL.pt"
+PLOT_EPOCHS = frozenset({1, 3, 5, 10, 15, 20, 25, 30})
+
+
+def _make_trajectory_plot(
+    true_rul: np.ndarray,
+    pred_rul: np.ndarray,
+    true_hi: np.ndarray,
+    pred_hi: np.ndarray,
+    epoch_label: str,
+    save_dir: Path,
+) -> None:
+    """4-panel trajectory plot: RUL, HI, histogram, Spearman rank scatter."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from scipy.stats import spearmanr
+    except ImportError:
+        return
+
+    rho, _ = spearmanr(true_rul, pred_rul)
+    t = np.arange(len(true_rul))
+    n = len(true_rul)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    case_label = save_dir.parent.name  # e.g. "Train1_fold1"
+    fig.suptitle(f"Val: {case_label} — Epoch {epoch_label}  |  Spearman ρ={rho:.3f}", fontsize=12)
+
+    # 1. True vs Pred RUL (hours)
+    ax = axes[0, 0]
+    ax.plot(t, true_rul / 3600, label="True", color="C0", lw=1.5)
+    ax.plot(t, pred_rul / 3600, label="Pred", color="C1", lw=1.2, alpha=0.85)
+    ax.set_xlabel("Window index")
+    ax.set_ylabel("RUL (h)")
+    ax.set_title("True vs Pred RUL")
+    ax.legend()
+
+    # 2. HI trajectory
+    ax = axes[0, 1]
+    ax.plot(t, true_hi, label="True HI", color="C0", lw=1.5)
+    ax.plot(t, pred_hi, label="Pred HI", color="C2", lw=1.2, alpha=0.85)
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_xlabel("Window index")
+    ax.set_ylabel("HI [0, 1]")
+    ax.set_title("HI Trajectory")
+    ax.legend()
+
+    # 3. RUL prediction distribution
+    ax = axes[1, 0]
+    bins = min(30, max(10, n // 5))
+    ax.hist(true_rul / 3600, bins=bins, alpha=0.6, label="True", color="C0", density=True)
+    ax.hist(pred_rul / 3600, bins=bins, alpha=0.6, label="Pred", color="C1", density=True)
+    ax.set_xlabel("RUL (h)")
+    ax.set_ylabel("Density")
+    ax.set_title("RUL Distribution")
+    ax.legend()
+
+    # 4. Spearman monotonicity: true rank vs pred rank
+    ax = axes[1, 1]
+    true_rank = np.argsort(np.argsort(-true_rul))
+    pred_rank = np.argsort(np.argsort(-pred_rul))
+    ax.scatter(true_rank, pred_rank, s=6, alpha=0.4, color="C3")
+    ax.plot([0, n - 1], [0, n - 1], "k--", lw=1, alpha=0.4, label="Perfect")
+    ax.set_xlabel("True RUL rank")
+    ax.set_ylabel("Pred RUL rank")
+    ax.set_title(f"Rank Monotonicity  (ρ={rho:.3f})")
+    ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    save_dir.mkdir(parents=True, exist_ok=True)
+    out = save_dir / f"epoch_{epoch_label}.png"
+    plt.savefig(out, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [plot] {out.name}")
 
 
 def _standardize(train_array: np.ndarray, val_array: np.ndarray):
@@ -62,10 +143,12 @@ def _tensor(arr: np.ndarray) -> torch.Tensor:
 
 
 def _balanced_weights(case_names: np.ndarray, sources: np.ndarray) -> torch.Tensor:
+    """1/count per case so every case contributes equally regardless of window count."""
     keys = np.asarray([f"{s}::{c}" for s, c in zip(sources, case_names)])
     unique, counts = np.unique(keys, return_counts=True)
     count_map = dict(zip(unique, counts))
     w = np.asarray([1.0 / count_map[k] for k in keys], dtype=np.float64)
+    w = w / w.sum() * len(w)
     return torch.tensor(w, dtype=torch.double)
 
 
@@ -103,7 +186,7 @@ def train(
 
     print("=" * 72)
     print(f"Dual-head training | seed={seed} | window={window_size} stride={stride}")
-    print(f"  loss: 0.5*MSE(RUL_log) + 0.3*MSE(HI) + 0.2*PairwiseRanking")
+    print(f"  loss: {RUL_LOSS_WEIGHT}*Huber(RUL_log) + {HI_LOSS_WEIGHT}*MSE(HI) + {RANKING_LOSS_WEIGHT}*PairwiseRank")
     print("=" * 72)
 
     X_vib, X_feat, hi, rul, metadata, baseline = load_dataset(
@@ -130,9 +213,10 @@ def train(
         if val_case is None:
             if RANDOM_VAL_CASE:
                 import random
-                rng = random.Random(VAL_CASE_SEED)
+                _val_seed = seed if seed is not None else VAL_CASE_SEED
+                rng = random.Random(_val_seed)  # None → system time (truly random)
                 val_case = rng.choice(tdms_cases)
-                note = f"seed={VAL_CASE_SEED}" if VAL_CASE_SEED is not None else "non-reproducible"
+                note = f"seed={_val_seed}" if _val_seed is not None else "non-reproducible"
                 print(f"\n[config] RANDOM_VAL_CASE=True -> picked val_case={val_case} ({note})")
             else:
                 val_case = VAL_CASE_DEFAULT
@@ -162,10 +246,19 @@ def train(
         hi_tr = hi[train_idx].astype(np.float32)
         hi_va = hi[val_idx].astype(np.float32)
 
+        # Integer case IDs for within-case ranking loss (train only)
+        tr_case_names = metadata.iloc[train_idx]["case_name"].astype(str).to_numpy()
+        unique_tr_cases = sorted(np.unique(tr_case_names).tolist())
+        case_to_int = {c: i for i, c in enumerate(unique_tr_cases)}
+        case_int_tr = torch.tensor(
+            [case_to_int[c] for c in tr_case_names], dtype=torch.long
+        )
+
         train_ds = TensorDataset(
             _tensor(Xv_tr), _tensor(Xf_tr),
             _tensor(rul_tr_log).unsqueeze(1),
             _tensor(hi_tr).unsqueeze(1),
+            case_int_tr,
         )
         if balanced:
             w = _balanced_weights(
@@ -191,20 +284,30 @@ def train(
         ).to(device)
         criterion = TrainingLoss()
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=WEIGHT_DECAY)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=SCHEDULER_T0, T_mult=2)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
-        best_val = float("inf")
+        # Early stopping: maximise validation A_RUL (closer to 1.0 = better)
+        best_val_arul = -float("inf")
+        best_arul_epoch = 0
         best_state = None
         patience = 0
+        plot_dir = RESULTS_DIR / "trajectory" / f"{held_out}_fold{fold}"
+        # Pre-compute fixed val targets once
+        ep_true_rul = rul[val_idx].astype(np.float64)
+        ep_true_hi  = hi[val_idx].astype(np.float64)
+        ep_pred_rul = np.zeros_like(ep_true_rul)
+        ep_pred_hi  = np.zeros(len(val_idx), dtype=np.float64)
+
         for epoch in range(1, epochs + 1):
             model.train()
             tr_rul = tr_hi = tr_rank = tr_tot = 0.0
-            for bv, bf, by_rul, by_hi in train_loader:
+            for bv, bf, by_rul, by_hi, by_case in train_loader:
                 bv, bf = bv.to(device), bf.to(device)
                 by_rul, by_hi = by_rul.to(device), by_hi.to(device)
+                by_case = by_case.to(device)
                 optimizer.zero_grad()
                 pred_rul, pred_hi = model(bv, bf)
-                loss, l_rul, l_hi, l_rank = criterion(pred_rul, pred_hi, by_rul, by_hi)
+                loss, l_rul, l_hi, l_rank = criterion(pred_rul, pred_hi, by_rul, by_hi, by_case)
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
@@ -216,39 +319,62 @@ def train(
 
             model.eval()
             va_rul = va_hi = va_rank = va_tot = 0.0
+            _ep_rul_log, _ep_hi = [], []
             with torch.no_grad():
                 for bv, bf, by_rul, by_hi in val_loader:
                     bv, bf = bv.to(device), bf.to(device)
                     by_rul, by_hi = by_rul.to(device), by_hi.to(device)
-                    pred_rul, pred_hi = model(bv, bf)
-                    loss, l_rul, l_hi, l_rank = criterion(pred_rul, pred_hi, by_rul, by_hi)
+                    pred_rul_b, pred_hi_b = model(bv, bf)
+                    loss, l_rul, l_hi, l_rank = criterion(pred_rul_b, pred_hi_b, by_rul, by_hi)
                     n = by_rul.size(0)
                     va_rul += l_rul.item() * n
                     va_hi += l_hi.item() * n
                     va_rank += l_rank.item() * n
                     va_tot += loss.item() * n
+                    _ep_rul_log.append(np.array(pred_rul_b.squeeze(1).cpu().tolist(), dtype=np.float32))
+                    _ep_hi.append(np.array(pred_hi_b.squeeze(1).cpu().tolist(), dtype=np.float32))
             n_tr, n_va = len(train_loader.dataset), len(val_loader.dataset)
             tr_rul /= n_tr; tr_hi /= n_tr; tr_rank /= n_tr; tr_tot /= n_tr
             va_rul /= n_va; va_hi /= n_va; va_rank /= n_va; va_tot /= n_va
             scheduler.step()
+            # Convert log-preds → seconds for A_RUL and plots
+            ep_pred_rul = np.maximum(np.expm1(np.clip(np.concatenate(_ep_rul_log), 0.0, 11.5)), 0.0)
+            ep_pred_hi  = np.concatenate(_ep_hi).astype(np.float64)
+            epoch_arul  = _arul(ep_pred_rul, ep_true_rul)
 
-            if va_tot < best_val:
-                best_val = va_tot
+            # Early stopping: maximise A_RUL — this is the competition metric.
+            if epoch_arul > best_val_arul:
+                best_val_arul = epoch_arul
+                best_arul_epoch = epoch
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 patience = 0
+                _make_trajectory_plot(ep_true_rul, ep_pred_rul, ep_true_hi, ep_pred_hi, "best", plot_dir)
             else:
                 patience += 1
                 if patience >= EARLY_STOPPING_PATIENCE:
-                    print(f"  [early-stop] epoch={epoch}")
+                    print(f"  [early-stop] epoch={epoch}  best_A_RUL={best_val_arul:.4f} @ ep{best_arul_epoch}")
+                    _make_trajectory_plot(ep_true_rul, ep_pred_rul, ep_true_hi, ep_pred_hi, "last", plot_dir)
                     break
+
+            # Trajectory plots at fixed epochs
+            if epoch in PLOT_EPOCHS:
+                _make_trajectory_plot(ep_true_rul, ep_pred_rul, ep_true_hi, ep_pred_hi,
+                                      str(epoch).zfill(2), plot_dir)
+
             if epoch % 5 == 0 or epoch == 1:
                 print(f"  epoch {epoch:03d}/{epochs} | "
                       f"tr(rul={tr_rul:.4f} hi={tr_hi:.4f} rank={tr_rank:.4f} tot={tr_tot:.4f}) "
                       f"va(rul={va_rul:.4f} hi={va_hi:.4f} rank={va_rank:.4f} tot={va_tot:.4f}) "
-                      f"patience={patience}")
+                      f"A_RUL={epoch_arul:.4f} patience={patience}")
 
         if best_state is not None:
             model.load_state_dict(best_state)
+
+        # "last" plot when training completed all epochs without early-stop
+        if patience < EARLY_STOPPING_PATIENCE:
+            _make_trajectory_plot(ep_true_rul, ep_pred_rul, ep_true_hi, ep_pred_hi, "last", plot_dir)
+
+        print(f"  [best A_RUL={best_val_arul:.4f} @ epoch={best_arul_epoch}]")
 
         # Inference on val set
         model.eval()
@@ -281,7 +407,7 @@ def train(
         fold_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": model.state_dict(),   # best A_RUL weights
                 "window_size": window_size,
                 "stride": stride,
                 "stft_nperseg": STFT_NPERSEG,
@@ -296,12 +422,14 @@ def train(
                 "feature_std": feat_std,
                 "degradation_baseline": baseline,
                 "denorm_scale": 1.0,
+                "best_arul": best_val_arul,
+                "best_arul_epoch": best_arul_epoch,
                 "fold_summary": fold_summaries[-1],
                 "seed": seed,
             },
             fold_path,
         )
-        print(f"Saved {fold_path}")
+        print(f"Saved {fold_path}  (best A_RUL={best_val_arul:.4f} @ ep{best_arul_epoch})")
         saved.append(fold_path)
 
         # Save per-fold OOF predictions

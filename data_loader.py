@@ -40,6 +40,7 @@ from config import (
     HI_FEATURES_ENABLED,
     HI_LABEL_MODE,
     HI_LABEL_POWER,
+    HI_SMOOTH_WINDOW,
     SAMPLING_RATE,
     TDMS_CHUNK_SAMPLES,
     TDMS_CHUNK_SECONDS,
@@ -48,7 +49,7 @@ from config import (
     VIBRATION_FEATURES_PER_CHANNEL,
 )
 from features.degradation import augment_with_degradation, compute_global_baseline
-from features.vibration import bearing_fault_amplitudes, stft_magnitude_vector
+from features.vibration import bearing_fault_amplitudes, shaft_harmonic_amplitudes, stft_magnitude_vector
 
 
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "cp949")
@@ -198,7 +199,7 @@ def _amplitude_band(signal: np.ndarray, low: float, high: float) -> float:
 
 
 def handcrafted_features_from_signal(signal: Iterable[float]) -> np.ndarray:
-    """Compute 10 RPM-independent statistics + 6 bearing fault frequency amplitudes."""
+    """10 statistics + 6 bearing fault amplitudes + 3 shaft harmonic order features = 19-dim."""
     arr = np.asarray(signal, dtype=np.float32)
     arr = arr[np.isfinite(arr)]
     out = np.zeros(HANDCRAFTED_DIM, dtype=np.float32)
@@ -230,10 +231,16 @@ def handcrafted_features_from_signal(signal: Iterable[float]) -> np.ndarray:
     for name, value in values.items():
         out[FEATURE_INDEX[name]] = _safe_float(value)
 
-    # Bearing fault frequency amplitudes: RPM estimated from this chunk's own FFT
-    fault_amps = bearing_fault_amplitudes(arr.astype(np.float64), SAMPLING_RATE)
+    arr64 = arr.astype(np.float64)
+    # Bearing fault frequency amplitudes (order-aligned to estimated shaft RPM)
+    fault_amps = bearing_fault_amplitudes(arr64, SAMPLING_RATE)
     for i, name in enumerate(("BPFI_1X", "BPFI_2X", "BPFO_1X", "BPFO_2X", "BSF_1X", "FTF_1X")):
         out[FEATURE_INDEX[name]] = _safe_float(fault_amps[i])
+
+    # Shaft harmonic order energy (1×/2×/3× shaft freq — RPM-invariant)
+    shaft_amps = shaft_harmonic_amplitudes(arr64, SAMPLING_RATE)
+    for i, name in enumerate(("SHAFT_1X", "SHAFT_2X", "SHAFT_3X")):
+        out[FEATURE_INDEX[name]] = _safe_float(shaft_amps[i])
 
     return out
 
@@ -256,6 +263,92 @@ def _rms_baseline_and_trajectory(feat_raw: np.ndarray) -> tuple[float, np.ndarra
     return baseline, rms_per_step
 
 
+def _norm01(arr: np.ndarray, eps: float = 1e-9) -> np.ndarray:
+    lo, hi = float(arr.min()), float(arr.max())
+    if hi - lo < eps:
+        return np.zeros_like(arr, dtype=np.float64)
+    return (arr - lo) / (hi - lo)
+
+
+def _compute_composite_hi(feat_raw: np.ndarray, smooth_window: int = HI_SMOOTH_WINDOW) -> np.ndarray:
+    """Cumulative damage accumulation HI.
+
+    Instantaneous damage rate per timestep (positive z-score deviations from
+    healthy baseline only, via ReLU) is accumulated via cumsum so HI reflects
+    "how much total damage has built up" rather than "current feature value".
+    This prevents the step-function / plateau collapse seen when using
+    instantaneous _norm01 values on sudden-failure bearings.
+
+    damage_rate_t = 0.45 * relu(bpf_zscore)   # BPFI+BPFO — most fault-specific
+                  + 0.25 * relu(kurt_zscore)   # impulsiveness
+                  + 0.20 * relu(rms_zscore)    # broadband energy
+                  + 0.10 * relu(rms_high_zscore)  # high-freq envelope
+
+    hi = cummax(smooth(cumsum(damage_rate))) → [0, 1]
+
+    z-scores use the first DEGRADATION_BASELINE_TIMESTEPS steps as the
+    healthy reference. ReLU suppresses normal fluctuations around baseline so
+    only genuine degradation contributes to the integral.
+    If no measurable damage is detected, falls back to linear time fraction.
+    """
+    from scipy.ndimage import uniform_filter1d
+
+    T = feat_raw.shape[0]
+    if T == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    n_base = min(DEGRADATION_BASELINE_TIMESTEPS, T)
+
+    def _feat(name: str) -> np.ndarray:
+        idx = FEATURE_INDEX.get(name)
+        if idx is None:
+            return np.zeros(T, dtype=np.float64)
+        return feat_raw[:, :, idx].mean(axis=1).astype(np.float64)
+
+    def _zscore(signal: np.ndarray) -> np.ndarray:
+        mu    = float(np.mean(signal[:n_base]))
+        sigma = float(np.std(signal[:n_base])) + 1e-9
+        return (signal - mu) / sigma
+
+    # Bearing fault band energy: BPFI (1X+2X) + BPFO (1X+2X)
+    bpf_energy = (_feat("BPFI_1X") + _feat("BPFI_2X") +
+                  _feat("BPFO_1X") + _feat("BPFO_2X"))
+
+    bpf_damage  = np.maximum(_zscore(bpf_energy),       0.0)
+    kurt_damage = np.maximum(_zscore(_feat("KURT")),     0.0)
+    rms_damage  = np.maximum(_zscore(_feat("RMS")),      0.0)
+    hi_damage   = np.maximum(_zscore(_feat("RMS_HIGH")), 0.0)
+
+    damage_rate = (0.45 * bpf_damage  +
+                   0.25 * kurt_damage +
+                   0.20 * rms_damage  +
+                   0.10 * hi_damage)
+
+    cum_damage = np.cumsum(damage_rate)
+
+    # Mix 40% linear time fraction so HI rises gradually throughout the entire
+    # life, not just at the end. Pure cumulative damage stays near-zero for
+    # sudden-failure bearings (BPFI/BPFO silent until fault develops), giving
+    # the network a near-flat target for 70% of life → useless gradient.
+    # Linear baseline ensures every epoch contributes gradient signal.
+    time_fraction = np.linspace(0.0, 1.0, T)
+
+    if float(cum_damage[-1]) < 1e-9:
+        return time_fraction.astype(np.float32)
+
+    cum_damage = 0.6 * (cum_damage / cum_damage[-1]) + 0.4 * time_fraction
+
+    if smooth_window > 1 and T >= smooth_window:
+        cum_smooth = uniform_filter1d(cum_damage, size=smooth_window, mode="nearest")
+    else:
+        cum_smooth = cum_damage
+
+    # cumsum is monotone by construction (relu ≥ 0), but smoothing can locally
+    # decrease — enforce monotonicity before final normalisation.
+    hi_mono = np.maximum.accumulate(cum_smooth)
+    return _norm01(hi_mono).astype(np.float32)
+
+
 def compute_hi_labels(
     times: np.ndarray,
     case_max: float,
@@ -263,13 +356,13 @@ def compute_hi_labels(
 ) -> np.ndarray:
     """Per-timestep HI label in [0, 1].
 
-    Time-based modes need only (times, case_max). Damage/hybrid modes also
-    need feat_raw (T, C, HANDCRAFTED_DIM) to read RMS.
-
-    "hybrid" uses CUMULATIVE damage (not instantaneous) so the label is
-    monotonically increasing and always reaches 1.0 at end-of-life.
-    This correctly handles cases like Train4 where instantaneous RMS growth
-    is erratic — cumulative damage grows smoothly throughout.
+    "composite" — multi-feature blend (rms+kurtosis+bpfo+envelope) → cummax →
+                  smooth → [0,1]. Monotonic, smoother dynamic range, and has
+                  meaningful variance in early/mid degradation unlike the
+                  hockey-stick shape of cumulative_damage mode.
+    "damage"    — legacy cumulative RMS damage.
+    "hybrid"    — 0.5*linear + 0.5*damage.
+    "linear"    — time fraction only (case-dependent, not recommended).
     """
     progress = np.clip(times / max(case_max, 1.0), 0.0, 1.0).astype(np.float32)
 
@@ -277,6 +370,10 @@ def compute_hi_labels(
         return progress
     if HI_LABEL_MODE == "power":
         return np.power(progress, HI_LABEL_POWER, dtype=np.float32)
+    if HI_LABEL_MODE == "composite":
+        if feat_raw is None:
+            raise ValueError("HI_LABEL_MODE='composite' requires feat_raw")
+        return _compute_composite_hi(feat_raw)
     if HI_LABEL_MODE in ("damage", "hybrid"):
         if feat_raw is None:
             raise ValueError(f"HI_LABEL_MODE={HI_LABEL_MODE} requires feat_raw")
@@ -284,8 +381,6 @@ def compute_hi_labels(
         if baseline < 1e-9:
             cum_damage_norm = np.zeros_like(rms_per_step, dtype=np.float32)
         else:
-            # Positive RMS deviation from healthy baseline, accumulated over time.
-            # Cumsum is monotonically increasing and always ends at its maximum.
             positive_dev = np.maximum(rms_per_step - baseline, 0.0)
             cum_damage = np.cumsum(positive_dev).astype(np.float64)
             final_cum = float(cum_damage[-1]) if len(cum_damage) > 0 else 0.0
@@ -295,7 +390,6 @@ def compute_hi_labels(
                 cum_damage_norm = np.zeros_like(rms_per_step, dtype=np.float32)
         if HI_LABEL_MODE == "damage":
             return cum_damage_norm
-        # hybrid: always spans [0, 1] by construction (both components end at 1.0)
         return (0.5 * progress + 0.5 * cum_damage_norm).astype(np.float32)
 
     raise ValueError(f"Unknown HI_LABEL_MODE: {HI_LABEL_MODE}")
@@ -306,7 +400,7 @@ def compute_hi_labels(
 # ============================================================================
 
 
-CACHE_VERSION = "v8_faultfreq"
+CACHE_VERSION = "v9_orderdomain"
 
 
 def _cache_key(paths: Iterable[Path], extra: str) -> str:
@@ -314,7 +408,6 @@ def _cache_key(paths: Iterable[Path], extra: str) -> str:
     for path in sorted(Path(p) for p in paths if Path(p).exists()):
         st = path.stat()
         digest.update(str(path.resolve()).encode("utf-8"))
-        digest.update(str(st.st_mtime_ns).encode("ascii"))
         digest.update(str(st.st_size).encode("ascii"))
     return digest.hexdigest()
 
@@ -628,9 +721,11 @@ def load_dataset(
 
     if include_original:
         for case_name, op_csv, vib_dir in discover_cases(original_dir):
+            print(f"  [load] {case_name} ...", end=" ", flush=True)
             vib, feat, times, case_max, _ = load_original_case_timesteps(
                 case_name, op_csv, vib_dir, use_cache=use_cache,
             )
+            print(f"{len(times)} steps  ({case_max/3600:.1f}h)")
             case_records.append(dict(
                 vib=vib, feat=feat, times=times, case_max=case_max,
                 case_name=case_name, source="original",
@@ -640,7 +735,9 @@ def load_dataset(
         for case_dir in sorted(Path(data2_dir).glob("Train_No_*")):
             if not (case_dir / "vibration.parquet").exists():
                 continue
+            print(f"  [load] {case_dir.name} ...", end=" ", flush=True)
             vib, feat, times, case_max, _ = load_data2_case_timesteps(case_dir, use_cache=use_cache)
+            print(f"{len(times)} steps  ({case_max/3600:.1f}h)")
             case_records.append(dict(
                 vib=vib, feat=feat, times=times, case_max=case_max,
                 case_name=case_dir.name, source="data2",
