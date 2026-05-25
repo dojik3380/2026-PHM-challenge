@@ -1,6 +1,6 @@
 # README_PHYSICAL_CONTEXT.md
 
-```md
+
 # PHM Bearing RUL Challenge — Physical & Dataset Context
 
 This document summarizes the PHM competition dataset, bearing physics, operating conditions, and critical assumptions for future agents/models.
@@ -308,4 +308,4 @@ DO NOT:
 - ignore metric asymmetry
 
 ---
-```
+
