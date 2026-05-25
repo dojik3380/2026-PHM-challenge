@@ -1,15 +1,19 @@
-"""Health-Indicator regression model.
+"""Dual-head RUL + HI regression model.
 
-Two-branch fusion:
-  - Vibration branch: STFT (4 x 1026) -> 1D CNN (SE) -> Projection -> BiLSTM -> Temporal Attention
-  - Handcrafted branch: 4 x 40 PHM features (after HI augmentation) -> Linear -> GRU
-  - Fusion: concat -> MLP -> sigmoid -> HI in [0, 1]
+Shared encoder:
+  - Vibration: STFT (4 x 1026) -> 1D CNN (SE) -> Projection -> BiLSTM -> Temporal Attention
+  - Handcrafted: 4 x 40 PHM features (after HI augmentation) -> Linear -> GRU
+  - Fusion: concat -> shared MLP -> 96-dim representation
 
-The operation/RPM branch was removed: the RPM ablation showed RPM did not
-contribute usable trajectory information.
-The output head is a single sigmoid that predicts the Health Indicator. RUL
-is recovered downstream in inference.py by curve-fitting the HI trajectory
-per case.
+Two heads on top:
+  - RUL head: linear, unbounded log-space output. Production target -- trained
+              with Huber(log) + Asymmetric(real). Matches the competition metric
+              which rewards conservative under-prediction.
+  - HI  head: sigmoid in [0, 1]. Auxiliary -- trained with MSE on the hybrid HI
+              label. Forces the shared encoder to learn degradation trajectory
+              features instead of falling into safe-low collapse.
+
+Inference uses the RUL head only. HI head exists solely as a supervision aid.
 """
 
 import math
@@ -19,9 +23,11 @@ import torch
 import torch.nn as nn
 
 from config import (
+    ASYMMETRIC_WEIGHT,
     DROPOUT,
     HANDCRAFTED_DIM,
     HI_FEATURES_ENABLED,
+    HUBER_WEIGHT,
     OVER_EST_PENALTY_SCALE,
     UNDER_EST_PENALTY_SCALE,
     VIB_HIDDEN,
@@ -65,8 +71,58 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :x.size(1), :]
 
 
+class AsymmetricRULLoss(nn.Module):
+    """Per-window asymmetric loss in REAL (seconds) space.
+
+    Matches the competition A_RUL score gradient. Over-prediction
+    (pred > target) is penalized 2.5x harder than under-prediction.
+    """
+
+    def __init__(self, over_scale: float = OVER_EST_PENALTY_SCALE,
+                 under_scale: float = UNDER_EST_PENALTY_SCALE):
+        super().__init__()
+        self.over_scale = over_scale
+        self.under_scale = under_scale
+
+    def forward(self, predictions_real: torch.Tensor, targets_real: torch.Tensor) -> torch.Tensor:
+        targets_real = targets_real.view_as(predictions_real)
+        # Clamp denominator to avoid blowing up near RUL=0 (last few windows).
+        denominator = torch.clamp(targets_real, min=1000.0)
+        er = torch.clamp(
+            100.0 * (targets_real - predictions_real) / denominator,
+            min=-500.0, max=500.0,
+        )
+        ln_two = 0.69314718
+        loss = torch.where(
+            er <= 0,
+            ln_two * (-er) / self.over_scale,    # over-prediction
+            ln_two * er / self.under_scale,      # under-prediction
+        )
+        return loss.mean()
+
+
+class CombinedRULLoss(nn.Module):
+    """RUL head loss: Huber(log) for stability + Asymmetric(real) for metric alignment."""
+
+    def __init__(self, huber_weight: float = HUBER_WEIGHT,
+                 asymmetric_weight: float = ASYMMETRIC_WEIGHT):
+        super().__init__()
+        self.huber = nn.HuberLoss()
+        self.asymmetric = AsymmetricRULLoss()
+        self.huber_weight = huber_weight
+        self.asymmetric_weight = asymmetric_weight
+
+    def forward(self, pred_log: torch.Tensor, target_log: torch.Tensor) -> torch.Tensor:
+        huber_loss = self.huber(pred_log, target_log)
+        pred_clamped = torch.clamp(pred_log, min=0.0, max=11.5)
+        pred_real = torch.expm1(pred_clamped)
+        target_real = torch.expm1(target_log)
+        asymmetric_loss = self.asymmetric(pred_real, target_real)
+        return self.huber_weight * huber_loss + self.asymmetric_weight * asymmetric_loss
+
+
 def asymmetric_rul_score_np(predictions, targets) -> np.ndarray:
-    """Competition A_RUL score, kept here for evaluation only."""
+    """Competition A_RUL score, NumPy version for evaluation."""
     predictions = np.asarray(predictions, dtype=np.float64)
     targets = np.asarray(targets, dtype=np.float64)
     denominator = np.maximum(np.abs(targets), 1e-6)
@@ -80,14 +136,14 @@ def asymmetric_rul_score_np(predictions, targets) -> np.ndarray:
     return np.exp(exponent)
 
 
-class HIModel(nn.Module):
-    """Two-branch HI regression: vibration STFT + handcrafted PHM features."""
+class DualHeadModel(nn.Module):
+    """Two-branch encoder + RUL head + HI head."""
 
     def __init__(
         self,
         vibration_channels: int = 4,
         vibration_features: int = VIBRATION_FEATURES_PER_CHANNEL,
-        handcrafted_dim: int = HANDCRAFTED_DIM * (4 if HI_FEATURES_ENABLED else 1),
+        handcrafted_dim: int = HANDCRAFTED_DIM * (3 if HI_FEATURES_ENABLED else 1),
         vib_hidden: int = VIB_HIDDEN,
         dropout: float = DROPOUT,
     ):
@@ -145,7 +201,12 @@ class HIModel(nn.Module):
             nn.Linear(fusion_dim, 96),
             nn.ReLU(),
             nn.Dropout(dropout),
+        )
+        # Two heads on top of the 96-dim shared representation.
+        self.rul_head = nn.Linear(96, 1)            # log-space RUL
+        self.hi_head = nn.Sequential(               # sigmoid HI in [0, 1]
             nn.Linear(96, 1),
+            nn.Sigmoid(),
         )
 
     def encode(self, x_vib: torch.Tensor, x_feat: torch.Tensor) -> torch.Tensor:
@@ -165,19 +226,20 @@ class HIModel(nn.Module):
         _, h_feat = self.feature_encoder(f)
         h_feat = h_feat.squeeze(0)
 
-        return torch.cat([h_vib, h_feat], dim=1)
+        return self.fusion(torch.cat([h_vib, h_feat], dim=1))
 
-    def forward(self, x_vib: torch.Tensor, x_feat: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_vib: torch.Tensor, x_feat: torch.Tensor):
+        """Return (rul_log_pred, hi_pred). rul_log is unbounded; hi is in [0, 1]."""
         h = self.encode(x_vib, x_feat)
-        return torch.sigmoid(self.fusion(h))
+        return self.rul_head(h), self.hi_head(h)
 
 
 def create_model(
     vibration_channels: int = 4,
     vibration_features: int = VIBRATION_FEATURES_PER_CHANNEL,
-    handcrafted_dim: int = HANDCRAFTED_DIM * (4 if HI_FEATURES_ENABLED else 1),
-) -> HIModel:
-    return HIModel(
+    handcrafted_dim: int = HANDCRAFTED_DIM * (3 if HI_FEATURES_ENABLED else 1),
+) -> DualHeadModel:
+    return DualHeadModel(
         vibration_channels=vibration_channels,
         vibration_features=vibration_features,
         handcrafted_dim=handcrafted_dim,

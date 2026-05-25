@@ -134,6 +134,29 @@ def hi_sequence_to_rul(
     return float(max(t_fail, t_now))
 
 
+def calibrate_hi(hi_pred: np.ndarray, anchors: dict) -> np.ndarray:
+    """Linear map from the model's compressed output range to the true HI scale.
+
+    The HI regressor trained with MSE on 7 cases typically produces predictions
+    in a narrow band (e.g. [0.4, 0.7]) even though the truth labels span
+    [0, ~0.9]. This is the small-data mean-fallback failure mode: ranking is
+    preserved but absolute scale collapses. We undo it post-hoc by anchoring:
+        pred_healthy -> true_healthy
+        pred_failure -> true_failure
+    and linearly mapping in between. Anchors are computed at training time
+    from first/last windows of training cases and saved with the checkpoint.
+    """
+    pred_h = anchors["pred_healthy"]
+    pred_f = anchors["pred_failure"]
+    true_h = anchors["true_healthy"]
+    true_f = anchors["true_failure"]
+    span = pred_f - pred_h
+    if abs(span) < 1e-6:
+        return np.clip(np.asarray(hi_pred, dtype=np.float64), 0.0, 1.0)
+    cal = (np.asarray(hi_pred, dtype=np.float64) - pred_h) / span * (true_f - true_h) + true_h
+    return np.clip(cal, 0.0, 1.0)
+
+
 def predict_rul_per_window(
     times: np.ndarray,
     hi: np.ndarray,

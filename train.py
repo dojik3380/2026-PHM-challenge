@@ -1,7 +1,11 @@
-"""Train HI regression model with leave-one-TDMS-case-out CV.
+"""Train DualHeadModel (RUL + HI) with leave-one-TDMS-case-out CV.
 
-Target: Health Indicator in [0, 1].
-Loss:   MSE (symmetric, no asymmetric pressure -> no safe-low collapse).
+Loss = RUL_LOSS_WEIGHT * (Huber(log) + Asymmetric(real))   # production target
+     + HI_LOSS_WEIGHT  * MSE(HI)                            # auxiliary supervision
+
+The RUL head is the production output. The HI head is auxiliary -- it forces
+the shared encoder to learn degradation trajectory features that a pure RUL
+head, on tiny data, can ignore by falling into safe-low collapse.
 """
 
 from __future__ import annotations
@@ -18,12 +22,15 @@ from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 from config import (
     BATCH_SIZE,
     DATA2_DIR,
+    DENORM_SCALE,
     DEVICE,
     EARLY_STOPPING_PATIENCE,
     EPOCHS,
+    HI_LOSS_WEIGHT,
     LEARNING_RATE,
     MODELS_DIR,
     RANDOM_VAL_CASE,
+    RUL_LOSS_WEIGHT,
     SCHEDULER_T0,
     STFT_FREQ_BINS,
     STFT_NOVERLAP,
@@ -36,11 +43,10 @@ from config import (
     WINDOW_SIZE,
 )
 from data_loader import load_dataset
-from inference import hi_sequence_to_rul
-from model import asymmetric_rul_score_np, create_model
+from model import CombinedRULLoss, asymmetric_rul_score_np, create_model
 
 
-MODEL_PATH = MODELS_DIR / "HI.pt"
+MODEL_PATH = MODELS_DIR / "RUL.pt"
 
 
 def _standardize(train_array: np.ndarray, val_array: np.ndarray):
@@ -90,10 +96,9 @@ def train(
     seed: Optional[int] = None,
     include_data2: bool = True,
 ) -> list[Path]:
-    """Train HI regression model.
+    """Train DualHeadModel.
 
-    Single-fold by default. Pass full_cv=True for leave-one-TDMS-case-out
-    4-fold ensemble training.
+    Single-fold by default. Pass full_cv=True for 4-fold leave-one-TDMS-case-out.
     """
     if seed is not None:
         import random as _r
@@ -103,7 +108,8 @@ def train(
         print(f"[seed] all RNGs set to {seed}")
 
     print("=" * 72)
-    print(f"HI regression training | seed={seed} | window={window_size} stride={stride}")
+    print(f"Dual-head (RUL + HI aux) training | seed={seed} | window={window_size} stride={stride}")
+    print(f"  loss weights: RUL={RUL_LOSS_WEIGHT}  HI={HI_LOSS_WEIGHT}  | DENORM_SCALE={DENORM_SCALE}")
     print("=" * 72)
 
     X_vib, X_feat, hi, rul, metadata, baseline = load_dataset(
@@ -132,8 +138,8 @@ def train(
                 import random
                 rng = random.Random(VAL_CASE_SEED)
                 val_case = rng.choice(tdms_cases)
-                seed_note = f"seed={VAL_CASE_SEED}" if VAL_CASE_SEED is not None else "non-reproducible"
-                print(f"\n[config] RANDOM_VAL_CASE=True -> picked val_case={val_case} ({seed_note})")
+                note = f"seed={VAL_CASE_SEED}" if VAL_CASE_SEED is not None else "non-reproducible"
+                print(f"\n[config] RANDOM_VAL_CASE=True -> picked val_case={val_case} ({note})")
             else:
                 val_case = VAL_CASE_DEFAULT
                 print(f"\n[config] RANDOM_VAL_CASE=False -> using VAL_CASE_DEFAULT={val_case}")
@@ -155,10 +161,18 @@ def train(
 
         Xv_tr, Xv_va, vib_mean, vib_std = _standardize(X_vib[train_idx], X_vib[val_idx])
         Xf_tr, Xf_va, feat_mean, feat_std = _standardize(X_feat[train_idx], X_feat[val_idx])
-        y_tr = hi[train_idx].astype(np.float32)
-        y_va = hi[val_idx].astype(np.float32)
 
-        train_ds = TensorDataset(_tensor(Xv_tr), _tensor(Xf_tr), _tensor(y_tr).unsqueeze(1))
+        # RUL target in log space; HI target directly.
+        rul_tr_log = np.log1p(rul[train_idx]).astype(np.float32)
+        rul_va_log = np.log1p(rul[val_idx]).astype(np.float32)
+        hi_tr = hi[train_idx].astype(np.float32)
+        hi_va = hi[val_idx].astype(np.float32)
+
+        train_ds = TensorDataset(
+            _tensor(Xv_tr), _tensor(Xf_tr),
+            _tensor(rul_tr_log).unsqueeze(1),
+            _tensor(hi_tr).unsqueeze(1),
+        )
         if balanced:
             w = _balanced_weights(
                 metadata.iloc[train_idx]["case_name"].astype(str).to_numpy(),
@@ -169,7 +183,9 @@ def train(
         else:
             train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(
-            TensorDataset(_tensor(Xv_va), _tensor(Xf_va), _tensor(y_va).unsqueeze(1)),
+            TensorDataset(_tensor(Xv_va), _tensor(Xf_va),
+                          _tensor(rul_va_log).unsqueeze(1),
+                          _tensor(hi_va).unsqueeze(1)),
             batch_size=batch_size, shuffle=False,
         )
 
@@ -179,7 +195,8 @@ def train(
             vibration_features=X_vib.shape[3],
             handcrafted_dim=X_feat.shape[-1],
         ).to(device)
-        criterion = nn.MSELoss()
+        rul_criterion = CombinedRULLoss()
+        hi_criterion = nn.MSELoss()
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=WEIGHT_DECAY)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=SCHEDULER_T0, T_mult=2)
 
@@ -188,28 +205,42 @@ def train(
         patience = 0
         for epoch in range(1, epochs + 1):
             model.train()
-            tr_loss = 0.0
-            for bv, bf, by in train_loader:
-                bv, bf, by = bv.to(device), bf.to(device), by.to(device)
+            tr_rul = tr_hi = tr_tot = 0.0
+            for bv, bf, by_rul, by_hi in train_loader:
+                bv, bf = bv.to(device), bf.to(device)
+                by_rul, by_hi = by_rul.to(device), by_hi.to(device)
                 optimizer.zero_grad()
-                loss = criterion(model(bv, bf), by)
+                pred_rul, pred_hi = model(bv, bf)
+                l_rul = rul_criterion(pred_rul, by_rul)
+                l_hi = hi_criterion(pred_hi, by_hi)
+                loss = RUL_LOSS_WEIGHT * l_rul + HI_LOSS_WEIGHT * l_hi
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-                tr_loss += loss.item() * by.size(0)
+                tr_rul += l_rul.item() * by_rul.size(0)
+                tr_hi += l_hi.item() * by_rul.size(0)
+                tr_tot += loss.item() * by_rul.size(0)
 
             model.eval()
-            va_loss = 0.0
+            va_rul = va_hi = va_tot = 0.0
             with torch.no_grad():
-                for bv, bf, by in val_loader:
-                    bv, bf, by = bv.to(device), bf.to(device), by.to(device)
-                    va_loss += criterion(model(bv, bf), by).item() * by.size(0)
-            tr_loss /= len(train_loader.dataset)
-            va_loss /= len(val_loader.dataset)
+                for bv, bf, by_rul, by_hi in val_loader:
+                    bv, bf = bv.to(device), bf.to(device)
+                    by_rul, by_hi = by_rul.to(device), by_hi.to(device)
+                    pred_rul, pred_hi = model(bv, bf)
+                    l_rul = rul_criterion(pred_rul, by_rul)
+                    l_hi = hi_criterion(pred_hi, by_hi)
+                    loss = RUL_LOSS_WEIGHT * l_rul + HI_LOSS_WEIGHT * l_hi
+                    va_rul += l_rul.item() * by_rul.size(0)
+                    va_hi += l_hi.item() * by_rul.size(0)
+                    va_tot += loss.item() * by_rul.size(0)
+            n_tr, n_va = len(train_loader.dataset), len(val_loader.dataset)
+            tr_rul /= n_tr; tr_hi /= n_tr; tr_tot /= n_tr
+            va_rul /= n_va; va_hi /= n_va; va_tot /= n_va
             scheduler.step()
 
-            if va_loss < best_val:
-                best_val = va_loss
+            if va_tot < best_val:
+                best_val = va_tot
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 patience = 0
             else:
@@ -218,32 +249,41 @@ def train(
                     print(f"  [early-stop] epoch={epoch}")
                     break
             if epoch % 5 == 0 or epoch == 1:
-                print(f"  epoch {epoch:03d}/{epochs} | train_mse={tr_loss:.5f} val_mse={va_loss:.5f} patience={patience}")
+                print(f"  epoch {epoch:03d}/{epochs} | "
+                      f"tr(rul={tr_rul:.4f} hi={tr_hi:.4f} tot={tr_tot:.4f}) "
+                      f"va(rul={va_rul:.4f} hi={va_hi:.4f} tot={va_tot:.4f}) "
+                      f"patience={patience}")
 
         if best_state is not None:
             model.load_state_dict(best_state)
 
-        # Inference on val set: predict HI, then convert to RUL per case (stage 2)
+        # Inference on val set
         model.eval()
-        hi_preds = []
+        rul_log_preds, hi_preds = [], []
         with torch.no_grad():
-            for bv, bf, _ in val_loader:
-                hi_preds.append(model(bv.to(device), bf.to(device)).squeeze(1).cpu().numpy())
+            for bv, bf, _, _ in val_loader:
+                pr, ph = model(bv.to(device), bf.to(device))
+                rul_log_preds.append(np.array(pr.squeeze(1).cpu().tolist(), dtype=np.float32))
+                hi_preds.append(np.array(ph.squeeze(1).cpu().tolist(), dtype=np.float32))
+        rul_log_preds = np.concatenate(rul_log_preds).astype(np.float64)
         hi_preds = np.concatenate(hi_preds).astype(np.float64)
 
-        val_meta = metadata.iloc[val_idx].reset_index(drop=True)
+        # RUL head -> seconds, then conservative shrinkage.
+        rul_pred_raw = np.expm1(np.clip(rul_log_preds, 0.0, 11.5))
+        rul_pred = np.maximum(rul_pred_raw * DENORM_SCALE, 0.0)
         true_rul = rul[val_idx].astype(np.float64)
         true_hi = hi[val_idx].astype(np.float64)
-        pred_rul = _convert_val_hi_to_rul(val_meta, hi_preds)
 
+        arul_raw = _arul(rul_pred_raw, true_rul)
+        arul = _arul(rul_pred, true_rul)
+        rul_mae = float(np.mean(np.abs(rul_pred - true_rul)))
         hi_mae = float(np.mean(np.abs(hi_preds - true_hi)))
-        rul_mae = float(np.mean(np.abs(pred_rul - true_rul)))
-        rul_arul = _arul(pred_rul, true_rul)
         print("\nValidation:")
-        print(f"  HI  MAE={hi_mae:.4f}")
-        print(f"  RUL MAE={rul_mae:.1f}  A_RUL={rul_arul:.4f}")
-        fold_summaries.append({"fold": fold, "held_out": held_out, "hi_mae": hi_mae,
-                               "rul_mae": rul_mae, "a_rul": rul_arul})
+        print(f"  RUL  MAE={rul_mae:7.0f}  A_RUL raw={arul_raw:.4f}  A_RUL (xDENORM_SCALE={DENORM_SCALE})={arul:.4f}")
+        print(f"  HI   MAE={hi_mae:.4f}  (auxiliary head)")
+        fold_summaries.append({"fold": fold, "held_out": held_out,
+                               "rul_mae": rul_mae, "a_rul": arul, "a_rul_raw": arul_raw,
+                               "hi_mae": hi_mae})
 
         seed_tag = f"_seed{seed}" if seed is not None else ""
         fold_path = Path(str(model_path).replace(".pt", f"{seed_tag}_fold{fold}.pt"))
@@ -264,6 +304,7 @@ def train(
                 "feature_mean": feat_mean,
                 "feature_std": feat_std,
                 "degradation_baseline": baseline,
+                "denorm_scale": DENORM_SCALE,
                 "fold_summary": fold_summaries[-1],
                 "seed": seed,
             },
@@ -272,12 +313,14 @@ def train(
         print(f"Saved {fold_path}")
         saved.append(fold_path)
 
-        # Save per-fold OOF predictions for offline diagnosis
+        # Save per-fold OOF predictions
+        val_meta = metadata.iloc[val_idx].reset_index(drop=True)
         oof_df = val_meta.copy()
+        oof_df["rul_true"] = true_rul
+        oof_df["rul_pred_raw"] = rul_pred_raw            # no shrinkage
+        oof_df["rul_pred"] = rul_pred                    # with DENORM_SCALE (production)
         oof_df["hi_true"] = true_hi
         oof_df["hi_pred"] = hi_preds
-        oof_df["rul_true"] = true_rul
-        oof_df["rul_pred"] = pred_rul
         oof_df["fold"] = fold
         oof_df["held_out_case"] = held_out
         oof_path = Path(str(fold_path).replace(".pt", "_oof.parquet"))
@@ -291,39 +334,20 @@ def train(
     print("\nFold summary:")
     for s in fold_summaries:
         print(f"  fold {s['fold']:>2} ({s['held_out']:>10}): "
-              f"HI_MAE={s['hi_mae']:.4f}  RUL_MAE={s['rul_mae']:7.0f}  A_RUL={s['a_rul']:.4f}")
+              f"RUL_MAE={s['rul_mae']:7.0f}  A_RUL={s['a_rul']:.4f}  (raw={s['a_rul_raw']:.4f})  "
+              f"HI_MAE={s['hi_mae']:.4f}")
     if len(fold_summaries) > 1:
         avg_arul = np.mean([s["a_rul"] for s in fold_summaries])
-        avg_hi = np.mean([s["hi_mae"] for s in fold_summaries])
-        print(f"  AVERAGE: HI_MAE={avg_hi:.4f}  A_RUL={avg_arul:.4f}")
+        avg_arul_raw = np.mean([s["a_rul_raw"] for s in fold_summaries])
+        avg_rul_mae = np.mean([s["rul_mae"] for s in fold_summaries])
+        avg_hi_mae = np.mean([s["hi_mae"] for s in fold_summaries])
+        print(f"  AVERAGE: A_RUL={avg_arul:.4f}  (raw={avg_arul_raw:.4f})  "
+              f"RUL_MAE={avg_rul_mae:.0f}  HI_MAE={avg_hi_mae:.4f}")
     return saved
 
 
-def _convert_val_hi_to_rul(val_meta, hi_preds):
-    """Convert per-window HI predictions to per-window RUL predictions.
-    Group by case, fit curve to that case's HI sequence, then for each window
-    compute RUL = predicted t_failure - window time_sec.
-    """
-    rul_pred = np.zeros(len(val_meta), dtype=np.float64)
-    val_meta = val_meta.reset_index(drop=True)
-    for case in val_meta["case_name"].unique():
-        mask = (val_meta["case_name"] == case).to_numpy()
-        idx = np.where(mask)[0]
-        case_times = val_meta.loc[mask, "time_sec"].to_numpy(dtype=np.float64)
-        case_max = float(val_meta.loc[mask, "case_max"].iloc[0])
-        case_hi = hi_preds[mask]
-
-        order = np.argsort(case_times)
-        t_ordered = case_times[order]
-        h_ordered = case_hi[order]
-        for j, t_now in enumerate(t_ordered):
-            t_fail = hi_sequence_to_rul(t_ordered[: j + 1], h_ordered[: j + 1], t_now, case_max)
-            rul_pred[idx[order[j]]] = max(0.0, t_fail - t_now)
-    return rul_pred
-
-
 def main() -> None:
-    p = argparse.ArgumentParser(description="Train HI regression model")
+    p = argparse.ArgumentParser(description="Train dual-head (RUL + HI aux) model")
     p.add_argument("--original-dir", type=Path, default=TRAIN_DIR)
     p.add_argument("--data2-dir", type=Path, default=DATA2_DIR)
     p.add_argument("--model-path", type=Path, default=MODEL_PATH)

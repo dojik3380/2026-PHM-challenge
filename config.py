@@ -54,8 +54,8 @@ HANDCRAFTED_FEATURES = (
 )
 HANDCRAFTED_DIM = len(HANDCRAFTED_FEATURES)
 DEGRADATION_BASELINE_TIMESTEPS = 10                # first N timesteps used as healthy baseline
-HI_FEATURES_ENABLED = True                          # raw 10-dim -> 40-dim via HI augment
-AUGMENTED_HANDCRAFTED_DIM = HANDCRAFTED_DIM * 4 if HI_FEATURES_ENABLED else HANDCRAFTED_DIM
+HI_FEATURES_ENABLED = True                          # 10-dim -> 30-dim: [rel, cummax_rel, damage_rel]
+AUGMENTED_HANDCRAFTED_DIM = HANDCRAFTED_DIM * 3 if HI_FEATURES_ENABLED else HANDCRAFTED_DIM
 
 
 # HI label generation ---------------------------------------------------------
@@ -95,14 +95,14 @@ TDMS_CHUNKS_PER_FILE = 6                             # 60 s TDMS file -> 6 chunk
 # windows enough to avoid trivial memorization and is 4x faster to train.
 WINDOW_SIZE = 32
 STRIDE = 4
-EPOCHS = 15
+EPOCHS = 25
 BATCH_SIZE = 32
 LEARNING_RATE = 5e-4
 DROPOUT = 0.5
 WEIGHT_DECAY = 1e-4
 VIB_HIDDEN = 64
-SCHEDULER_T0 = 10
-EARLY_STOPPING_PATIENCE = 6
+SCHEDULER_T0 = 12
+EARLY_STOPPING_PATIENCE = 8
 
 # Validation holdout (single-fold leave-one-TDMS-case-out).
 RANDOM_VAL_CASE = True
@@ -110,12 +110,32 @@ VAL_CASE_DEFAULT = "Train2"
 VAL_CASE_SEED = None
 
 
-# Asymmetric metric (evaluation only, NOT used in training loss) -------------
-# The competition's A_RUL score. Kept here because evaluate.py reports it, but
-# train.py uses pure MSE on HI -- the asymmetric pressure is what caused the
-# safe-low collapse, so it has been removed from supervision entirely.
+# Loss ------------------------------------------------------------------------
+# Phase 1 hybrid: the model has two heads sharing one encoder.
+#   - RUL head:  log-space regression, trained with Huber(log) + Asymmetric(real).
+#                This is the production output -- it directly matches the
+#                competition metric (which heavily rewards conservative
+#                under-prediction) so we let it learn that bias.
+#   - HI head:   sigmoid in [0, 1], trained with MSE on the hybrid HI label.
+#                Acts as an auxiliary task -- forces the shared encoder to learn
+#                degradation trajectory features (which a pure RUL head, on tiny
+#                data, can ignore by falling into safe-low collapse).
+#
+# Total loss = RUL_LOSS_WEIGHT * RUL_loss + HI_LOSS_WEIGHT * HI_loss.
+RUL_LOSS_WEIGHT = 0.7
+HI_LOSS_WEIGHT = 0.3
+
+# Internal RUL loss = HUBER_WEIGHT * Huber(log) + ASYMMETRIC_WEIGHT * Asymmetric(real).
+HUBER_WEIGHT = 0.15
+ASYMMETRIC_WEIGHT = 0.85
 OVER_EST_PENALTY_SCALE = 20.0
 UNDER_EST_PENALTY_SCALE = 50.0
+
+# Post-inference scale applied to raw RUL seconds: pred_final = pred_raw * DENORM_SCALE.
+# Tuned on OOF parquets from seed42 full-CV: raw preds are systematically low
+# (model under-predicts due to asymmetric loss bias), so scale > 1.0 recovers signal.
+# OOF sweep (30-dim relative features, seed42): 1.0→0.4215, 1.80→0.4673 (peak). Set to 1.80.
+DENORM_SCALE = 1.80
 
 
 # Runtime ---------------------------------------------------------------------

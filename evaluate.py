@@ -1,12 +1,13 @@
-"""Ensemble inference on data/Test using HI fold checkpoints.
+"""Ensemble inference on data/Test using DualHead fold checkpoints.
 
 For each Test case:
-  1. Build all sliding windows (the full HI trajectory).
-  2. Average HI predictions across fold checkpoints.
-  3. Curve-fit the averaged HI sequence and extrapolate to threshold.
-  4. RUL = t_failure - t_last_window.
+  1. Build all sliding windows.
+  2. Run each fold's model; collect RUL-head log predictions.
+  3. Ensemble (mean) the log predictions across folds.
+  4. expm1 -> seconds -> multiply by DENORM_SCALE for conservative bias.
+  5. Report RUL at the LAST window of the case.
 
-Writes File / RUL_Score Excel.
+The HI head is auxiliary and ignored at inference.
 """
 
 from __future__ import annotations
@@ -19,16 +20,15 @@ import numpy as np
 import pandas as pd
 import torch
 
-from config import DEVICE, RESULTS_DIR, TEAM_NAME, TEST_DIR, WINDOW_SIZE
+from config import DENORM_SCALE, DEVICE, RESULTS_DIR, TEAM_NAME, TEST_DIR, WINDOW_SIZE
 from data_loader import load_inference_dataset
-from inference import hi_sequence_to_rul
 from model import create_model
 from train import MODEL_PATH
 
 
 def _standardize(arr: np.ndarray, mean, std) -> np.ndarray:
-    m = mean.cpu().numpy() if isinstance(mean, torch.Tensor) else np.asarray(mean)
-    s = std.cpu().numpy() if isinstance(std, torch.Tensor) else np.asarray(std)
+    m = np.array(mean.cpu().tolist()) if isinstance(mean, torch.Tensor) else np.asarray(mean)
+    s = np.array(std.cpu().tolist()) if isinstance(std, torch.Tensor) else np.asarray(std)
     s = np.where(s < 1e-8, 1.0, s)
     return ((arr - m) / s).astype(np.float32)
 
@@ -57,18 +57,19 @@ def _load_fold(ckpt_path: Path, device: torch.device):
     return model, ckpt
 
 
-def _predict_hi(model: torch.nn.Module, X_vib: np.ndarray, X_feat: np.ndarray,
-                device: torch.device, batch_size: int = 16) -> np.ndarray:
-    preds: list[np.ndarray] = []
+def _predict(model: torch.nn.Module, X_vib: np.ndarray, X_feat: np.ndarray,
+             device: torch.device, batch_size: int = 16) -> tuple[np.ndarray, np.ndarray]:
+    rul_log, hi = [], []
     n = len(X_vib)
     with torch.no_grad():
         for start in range(0, n, batch_size):
             end = min(start + batch_size, n)
             vb = torch.from_numpy(np.ascontiguousarray(X_vib[start:end])).to(device)
             fb = torch.from_numpy(np.ascontiguousarray(X_feat[start:end])).to(device)
-            out = model(vb, fb).squeeze(1).cpu().numpy()
-            preds.append(out)
-    return np.concatenate(preds, axis=0)
+            pr, ph = model(vb, fb)
+            rul_log.append(np.array(pr.squeeze(1).cpu().tolist(), dtype=np.float32))
+            hi.append(np.array(ph.squeeze(1).cpu().tolist(), dtype=np.float32))
+    return np.concatenate(rul_log, axis=0), np.concatenate(hi, axis=0)
 
 
 def evaluate_test(
@@ -93,8 +94,7 @@ def evaluate_test(
     baseline = first_ckpt.get("degradation_baseline")
     if baseline is None:
         raise RuntimeError(
-            f"Checkpoint {fold_paths[0].name} has no 'degradation_baseline'. "
-            f"Retrain with the current pipeline."
+            f"Checkpoint {fold_paths[0].name} has no 'degradation_baseline'. Retrain."
         )
 
     print(f"\nBuilding inference dataset from {test_dir} (window_size={window_size}) ...")
@@ -106,35 +106,44 @@ def evaluate_test(
     print(metadata.groupby("case_name").size().to_string())
 
     device = torch.device(DEVICE)
+    fold_rul_log: list[np.ndarray] = []
     fold_hi: list[np.ndarray] = []
     for fp in fold_paths:
         model, ckpt = _load_fold(fp, device)
         X_vib = _standardize(X_vib_raw, ckpt["vibration_mean"], ckpt["vibration_std"])
         X_feat = _standardize(X_feat_raw, ckpt["feature_mean"], ckpt["feature_std"])
-        hi = _predict_hi(model, X_vib, X_feat, device)
-        print(f"  {fp.name}: HI mean={hi.mean():.3f} range=[{hi.min():.3f}, {hi.max():.3f}]")
+        rul_log, hi = _predict(model, X_vib, X_feat, device)
+        rul_real = np.expm1(np.clip(rul_log, 0.0, 11.5))
+        print(f"  {fp.name}: RUL seconds mean={rul_real.mean():.0f} range=[{rul_real.min():.0f}, {rul_real.max():.0f}]  "
+              f"HI mean={hi.mean():.3f}")
+        fold_rul_log.append(rul_log)
         fold_hi.append(hi)
-    hi_ensemble = np.mean(np.stack(fold_hi, axis=0), axis=0)
 
-    # Stage 2: per-case curve fit -> RUL at the LAST window.
+    # Ensemble in log space, then expm1, then DENORM_SCALE shrinkage.
+    rul_log_ens = np.mean(np.stack(fold_rul_log, axis=0), axis=0)
+    rul_seconds = np.expm1(np.clip(rul_log_ens, 0.0, 11.5))
+    rul_final = np.maximum(rul_seconds * DENORM_SCALE, 0.0)
+    hi_ens = np.mean(np.stack(fold_hi, axis=0), axis=0)
+    print(f"\n[ensemble] RUL mean={rul_seconds.mean():.0f}  after DENORM_SCALE({DENORM_SCALE})={rul_final.mean():.0f}")
+
+    # Report RUL at the LAST window per case.
     results = []
     for case_name in sorted(metadata["case_name"].unique()):
         mask = (metadata["case_name"] == case_name).to_numpy()
         case_meta = metadata[mask].sort_values("end_timestep").reset_index(drop=True)
-        case_times = case_meta["time_sec"].to_numpy(dtype=np.float64)
-        case_hi = hi_ensemble[mask][case_meta.index.to_numpy()]
-        # case_meta is already sorted; align hi by re-applying argsort if needed
-        order = np.argsort(case_meta["end_timestep"].to_numpy())
-        case_times = case_times[order]
-        case_hi = case_hi[order]
-        t_now = float(case_times[-1])
-        t_fail = hi_sequence_to_rul(case_times, case_hi, t_now=t_now, case_max=None)
-        rul = max(0.0, t_fail - t_now)
+        # Last-window index in the (concatenated) inference arrays.
+        last_pos = int(case_meta["end_timestep"].idxmax()) if False else int(np.argmax(case_meta["end_timestep"].to_numpy()))
+        last_global = np.where(mask)[0][np.argsort(case_meta.index.to_numpy())][last_pos]
+        # The above is fragile; simpler: take the global window with the largest end_timestep within this case.
+        case_global_idx = np.where(mask)[0]
+        case_end_ts = metadata.iloc[case_global_idx]["end_timestep"].to_numpy()
+        last_global = case_global_idx[int(np.argmax(case_end_ts))]
+        rul_pred = float(rul_final[last_global])
         results.append({
             "File": case_name,
-            "RUL_Score": int(round(rul)),
-            "hi_last": float(case_hi[-1]),
-            "hi_mean": float(case_hi.mean()),
+            "RUL_Score": int(round(rul_pred)),
+            "rul_seconds_raw": float(rul_seconds[last_global]),
+            "hi_last": float(hi_ens[last_global]),
             "n_windows": int(mask.sum()),
         })
 
@@ -153,7 +162,7 @@ def evaluate_test(
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="HI ensemble inference on TDMS Test set")
+    p = argparse.ArgumentParser(description="Dual-head ensemble inference on TDMS Test set")
     p.add_argument("--test-dir", type=Path, default=TEST_DIR)
     p.add_argument("--model-path", type=Path, default=MODEL_PATH)
     p.add_argument("--output", type=Path, default=None,

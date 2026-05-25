@@ -259,6 +259,11 @@ def compute_hi_labels(
 
     Time-based modes need only (times, case_max). Damage/hybrid modes also
     need feat_raw (T, C, HANDCRAFTED_DIM) to read RMS.
+
+    "hybrid" uses CUMULATIVE damage (not instantaneous) so the label is
+    monotonically increasing and always reaches 1.0 at end-of-life.
+    This correctly handles cases like Train4 where instantaneous RMS growth
+    is erratic — cumulative damage grows smoothly throughout.
     """
     progress = np.clip(times / max(case_max, 1.0), 0.0, 1.0).astype(np.float32)
 
@@ -271,14 +276,21 @@ def compute_hi_labels(
             raise ValueError(f"HI_LABEL_MODE={HI_LABEL_MODE} requires feat_raw")
         baseline, rms_per_step = _rms_baseline_and_trajectory(feat_raw)
         if baseline < 1e-9:
-            damage = np.zeros_like(rms_per_step)
+            cum_damage_norm = np.zeros_like(rms_per_step, dtype=np.float32)
         else:
-            growth = np.maximum(rms_per_step - baseline, 0.0) / baseline
-            damage = np.tanh(growth / max(HI_DAMAGE_SCALE, 1e-6))
-        damage = damage.astype(np.float32)
+            # Positive RMS deviation from healthy baseline, accumulated over time.
+            # Cumsum is monotonically increasing and always ends at its maximum.
+            positive_dev = np.maximum(rms_per_step - baseline, 0.0)
+            cum_damage = np.cumsum(positive_dev).astype(np.float64)
+            final_cum = float(cum_damage[-1]) if len(cum_damage) > 0 else 0.0
+            if final_cum > 1e-9:
+                cum_damage_norm = (cum_damage / final_cum).astype(np.float32)
+            else:
+                cum_damage_norm = np.zeros_like(rms_per_step, dtype=np.float32)
         if HI_LABEL_MODE == "damage":
-            return damage
-        return (0.5 * progress + 0.5 * damage).astype(np.float32)
+            return cum_damage_norm
+        # hybrid: always spans [0, 1] by construction (both components end at 1.0)
+        return (0.5 * progress + 0.5 * cum_damage_norm).astype(np.float32)
 
     raise ValueError(f"Unknown HI_LABEL_MODE: {HI_LABEL_MODE}")
 

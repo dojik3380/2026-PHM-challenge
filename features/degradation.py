@@ -55,9 +55,13 @@ def augment_with_degradation(
     baseline: np.ndarray,
     eps: float = EPS,
 ) -> np.ndarray:
-    """feat: (T, C, F), baseline: (C, F) → (T, C, F*4).
+    """feat: (T, C, F), baseline: (C, F) → (T, C, F*3).
 
-    concat(raw, rel, cummax_rel, cumulative_damage_rel) along feature axis.
+    Returns [rel, cummax_rel, cumulative_damage_rel] — relative-only views.
+    Raw absolute features are intentionally excluded so the handcrafted branch
+    is invariant to inter-case amplitude differences (e.g., Train4 whose baseline
+    kurtosis is ~68 vs ~3.5 for other cases, causing fold4 OOD collapse when raw
+    features are used).
 
     Uses abs(baseline) in denominator so signed baseline values (e.g., skew)
     don't flip sign of ratios.
@@ -75,7 +79,7 @@ def augment_with_degradation(
     damage = np.maximum(feat - abs_baseline, 0.0)        # positive deviation from baseline only
     cumulative_damage_rel = np.cumsum(damage, axis=0) / denom
 
-    out = np.concatenate([feat, rel, cummax_rel, cumulative_damage_rel], axis=-1)
+    out = np.concatenate([rel, cummax_rel, cumulative_damage_rel], axis=-1)
     return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
 
