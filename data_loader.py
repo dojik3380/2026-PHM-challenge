@@ -31,6 +31,7 @@ import pandas as pd
 from nptdms import TdmsFile
 
 from config import (
+    HI_ALPHA,
     DATA2_DIR,
     DATA2_FEATURE_CACHE_DIR,
     DEGRADATION_BASELINE_TIMESTEPS,
@@ -326,17 +327,16 @@ def _compute_composite_hi(feat_raw: np.ndarray, smooth_window: int = HI_SMOOTH_W
 
     cum_damage = np.cumsum(damage_rate)
 
-    # Mix 40% linear time fraction so HI rises gradually throughout the entire
-    # life, not just at the end. Pure cumulative damage stays near-zero for
-    # sudden-failure bearings (BPFI/BPFO silent until fault develops), giving
-    # the network a near-flat target for 70% of life → useless gradient.
-    # Linear baseline ensures every epoch contributes gradient signal.
+    # Stage 2 파이프라인을 위해 순수 물리 손상만 사용.
+    # 선형 성분을 제거하면 초반 flat → 후반 급상승 (hockey-stick) 형태가 됨.
+    # Stage 2 지수 피팅이 이 형태에서 정확히 동작한다.
+    # fallback: 물리 손상이 거의 없는 케이스 (전기 결함 없음) → linear
     time_fraction = np.linspace(0.0, 1.0, T)
 
     if float(cum_damage[-1]) < 1e-9:
         return time_fraction.astype(np.float32)
 
-    cum_damage = 0.6 * (cum_damage / cum_damage[-1]) + 0.4 * time_fraction
+    cum_damage = cum_damage / cum_damage[-1]   # 순수 물리 손상, 선형 혼합 없음
 
     if smooth_window > 1 and T >= smooth_window:
         cum_smooth = uniform_filter1d(cum_damage, size=smooth_window, mode="nearest")
@@ -356,16 +356,23 @@ def compute_hi_labels(
 ) -> np.ndarray:
     """Per-timestep HI label in [0, 1].
 
-    "composite" — multi-feature blend (rms+kurtosis+bpfo+envelope) → cummax →
-                  smooth → [0,1]. Monotonic, smoother dynamic range, and has
-                  meaningful variance in early/mid degradation unlike the
-                  hockey-stick shape of cumulative_damage mode.
-    "damage"    — legacy cumulative RMS damage.
-    "hybrid"    — 0.5*linear + 0.5*damage.
-    "linear"    — time fraction only (case-dependent, not recommended).
+    "exponential" — HI(t) = (e^(α·t/T_max) - 1) / (e^α - 1), α=HI_ALPHA.
+                    Convex shape: stays low early, accelerates near failure.
+                    Consistent across all cases → Stage 2 curve fitting stable.
+    "composite"   — multi-feature blend (rms+kurtosis+bpfo+envelope) → cummax →
+                    smooth → [0,1].
+    "damage"      — legacy cumulative RMS damage.
+    "hybrid"      — 0.5*linear + 0.5*damage.
+    "linear"      — time fraction only (case-dependent, not recommended).
     """
     progress = np.clip(times / max(case_max, 1.0), 0.0, 1.0).astype(np.float32)
 
+    if HI_LABEL_MODE == "exponential":
+        # HI(t) = (e^(α·progress) - 1) / (e^α - 1)
+        alpha = float(HI_ALPHA)
+        denom = float(np.exp(alpha) - 1.0)
+        hi = (np.exp(alpha * progress.astype(np.float64)) - 1.0) / denom
+        return np.clip(hi, 0.0, 1.0).astype(np.float32)
     if HI_LABEL_MODE == "linear":
         return progress
     if HI_LABEL_MODE == "power":
@@ -820,6 +827,7 @@ def load_inference_dataset(
                 "end_timestep": end - 1,
                 "time_sec": float(times[end - 1]),
                 "num_timesteps_total": n,
+                "case_max": float(times[-1]),
             })
 
     return (

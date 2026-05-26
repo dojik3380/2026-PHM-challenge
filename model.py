@@ -1,19 +1,19 @@
-"""Dual-head RUL + HI regression model.
+"""Stage-1 HI prediction model (2-stage PHM pipeline).
 
 Shared encoder:
-  - Vibration: STFT (4 x 1026) -> 1D CNN (SE) -> Projection -> BiLSTM -> Temporal Attention
-  - Handcrafted: 4 x 40 PHM features (after HI augmentation) -> Linear -> GRU
-  - Fusion: concat -> shared MLP -> 96-dim representation
+  - Vibration : STFT (4 × 1026) → 1D CNN (SE) → Projection → BiLSTM → Temporal Attention
+  - Handcrafted: 4 × (F*3+1) augmented features → Linear → GRU
+                 [rel, cummax_rel, cumdamage_rel, energy_cumdamage] per channel
+  - Fusion     : concat → shared MLP → 96-dim representation
 
-Two heads on top:
-  - RUL head: linear, unbounded log-space output. Production target -- trained
-              with Huber(log) + Asymmetric(real). Matches the competition metric
-              which rewards conservative under-prediction.
-  - HI  head: sigmoid in [0, 1]. Auxiliary -- trained with MSE on the hybrid HI
-              label. Forces the shared encoder to learn degradation trajectory
-              features instead of falling into safe-low collapse.
+Single head:
+  - HI head: sigmoid [0, 1]. THIS IS the only output.
+             Trained with Huber(δ=0.3, late×5) + HIPairwiseRankingLoss.
 
-Inference uses the RUL head only. HI head exists solely as a supervision aid.
+Inference sequence (§4):
+  1. HI head → per-window HI trajectory.
+  2. Stage-2 fits f(t) = a·e^(bt)+c to the trajectory.
+  3. T_failure = (1/b)·ln((1-c)/a); RUL = T_failure - t_current.
 """
 
 import math
@@ -24,13 +24,12 @@ import torch
 import torch.nn as nn
 
 from config import (
+    AUGMENTED_HANDCRAFTED_DIM,
     DROPOUT,
-    HANDCRAFTED_DIM,
-    HI_FEATURES_ENABLED,
     HI_LOSS_WEIGHT,
+    HI_RANK_LOSS_WEIGHT,
+    HUBER_DELTA,
     OVER_EST_PENALTY_SCALE,
-    RANKING_LOSS_WEIGHT,
-    RUL_LOSS_WEIGHT,
     UNDER_EST_PENALTY_SCALE,
     VIB_HIDDEN,
     VIBRATION_FEATURES_PER_CHANNEL,
@@ -73,141 +72,118 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :x.size(1), :]
 
 
-class AsymmetricRULLoss(nn.Module):
-    """A_RUL metric in REAL (seconds) space — used for EVALUATION ONLY, not training.
+class HIPairwiseRankingLoss(nn.Module):
+    """HI 단조성 강제: 같은 케이스 내 later window → pred_hi 더 큼.
 
-    Over-prediction (pred > target) is penalized 2.5× harder than under-prediction,
-    matching the competition scoring function.
+    true_hi[j] > true_hi[i] + min_gap인 쌍에서
+    pred_hi[j] > pred_hi[i] - margin 패널티.
     """
 
-    def __init__(self, over_scale: float = OVER_EST_PENALTY_SCALE,
-                 under_scale: float = UNDER_EST_PENALTY_SCALE):
-        super().__init__()
-        self.over_scale = over_scale
-        self.under_scale = under_scale
-
-    def forward(self, predictions_real: torch.Tensor, targets_real: torch.Tensor) -> torch.Tensor:
-        targets_real = targets_real.view_as(predictions_real)
-        denominator = torch.clamp(targets_real, min=1000.0)
-        er = torch.clamp(
-            100.0 * (targets_real - predictions_real) / denominator,
-            min=-500.0, max=500.0,
-        )
-        ln_two = 0.69314718
-        loss = torch.where(
-            er <= 0,
-            ln_two * (-er) / self.over_scale,
-            ln_two * er / self.under_scale,
-        )
-        return loss.mean()
-
-
-class PairwiseRankingLoss(nn.Module):
-    """Monotonicity regularizer: pred_rul[i] > pred_rul[j] when true_rul[i] > true_rul[j].
-
-    When case_ids is provided, only within-case pairs are used — this enforces
-    "earlier window → higher RUL" without noisy cross-case comparisons.
-    min_gap=0.2 in log space ≈ 22% RUL difference; filters near-identical windows.
-    """
-
-    def __init__(self, margin: float = 0.05, min_gap: float = 0.2):
+    def __init__(self, margin: float = 0.02, min_gap: float = 0.05):
         super().__init__()
         self.margin = margin
         self.min_gap = min_gap
 
     def forward(
         self,
-        pred_log: torch.Tensor,
-        target_log: torch.Tensor,
-        case_ids: Optional[torch.Tensor] = None,
+        pred_hi:   torch.Tensor,
+        target_hi: torch.Tensor,
+        case_ids:  Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        pred   = pred_log.view(-1)
-        target = target_log.view(-1)
+        pred   = pred_hi.view(-1)
+        target = target_hi.view(-1)
         n = pred.size(0)
         if n < 2:
             return pred.sum() * 0.0
 
-        target_diff = target.unsqueeze(1) - target.unsqueeze(0)   # (n, n)
-        pred_diff   = pred.unsqueeze(1)   - pred.unsqueeze(0)     # (n, n)
-        mask = target_diff > self.min_gap
+        diff_t = target.unsqueeze(0) - target.unsqueeze(1)  # [j]-[i]
+        diff_p = pred.unsqueeze(0)   - pred.unsqueeze(1)
+        mask = diff_t > self.min_gap
 
         if case_ids is not None:
-            same_case = case_ids.view(-1, 1) == case_ids.view(1, -1)
+            same_case = case_ids.view(1, -1) == case_ids.view(-1, 1)
             mask = mask & same_case
 
         if not mask.any():
             return pred.sum() * 0.0
 
-        loss = torch.clamp(self.margin - pred_diff[mask], min=0.0)
-        return loss.mean()
-
-
-class SoftAsymmetricLogLoss(nn.Module):
-    """Weighted MSE in log-space: over-prediction penalized over_scale× harder.
-
-    pred_log > target_log  →  pred_real > target_real  →  over-prediction.
-    Using log-space residuals keeps gradient magnitudes bounded (unlike real-space
-    which explodes for large RUL values) while still biasing the model toward
-    conservative under-prediction to match the competition's asymmetric penalty.
-    """
-
-    def __init__(self, over_scale: float = 2.5):
-        super().__init__()
-        self.over_scale = over_scale
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        diff = pred.view(-1) - target.view(-1)
-        weight = torch.where(diff > 0,
-                             torch.full_like(diff, self.over_scale),
-                             torch.ones_like(diff))
-        return (weight * diff.pow(2)).mean()
+        return torch.clamp(self.margin - diff_p[mask], min=0.0).mean()
 
 
 class TrainingLoss(nn.Module):
-    """L = 0.70*Huber(RUL_log) + 0.20*MSE(HI) + 0.10*PairwiseRanking
-
-    Pure Huber for RUL: unbiased regression in log-space. SoftAsymmetricLogLoss
-    was removed because over_scale=2.5 caused systematic 35% under-prediction in
-    early life, lowering A_RUL significantly (under-prediction is also penalized
-    by the competition metric). Asymmetric calibration is applied post-hoc via
-    CALIBRATION_SHRINK if needed.
-    Returns (total, l_rul, l_hi, l_rank) for per-component logging.
-    """
+    """L = hi_weight * Huber + hi_rank_weight * Rank + λ1 * Mono + λ2 * Smooth"""
 
     def __init__(
         self,
-        rul_weight:  float = RUL_LOSS_WEIGHT,
-        hi_weight:   float = HI_LOSS_WEIGHT,
-        rank_weight: float = RANKING_LOSS_WEIGHT,
+        hi_weight:      float = HI_LOSS_WEIGHT,
+        hi_rank_weight: float = HI_RANK_LOSS_WEIGHT,
+        lambda1:        float = 0.5,
+        lambda2:        float = 0.1,
     ):
         super().__init__()
-        self.rul_huber = nn.HuberLoss(delta=1.0)
-        self.hi_loss   = nn.MSELoss()
-        self.ranking   = PairwiseRankingLoss()
-        self.rul_weight  = rul_weight
-        self.hi_weight   = hi_weight
-        self.rank_weight = rank_weight
+        self.hi_loss      = nn.HuberLoss(delta=HUBER_DELTA, reduction="none")
+        self.hi_ranking   = HIPairwiseRankingLoss()
+        self.hi_weight      = hi_weight
+        self.hi_rank_weight = hi_rank_weight
+        self.lambda1        = lambda1
+        self.lambda2        = lambda2
 
     def forward(
         self,
-        pred_rul_log:   torch.Tensor,
-        pred_hi:        torch.Tensor,
-        target_rul_log: torch.Tensor,
-        target_hi:      torch.Tensor,
-        case_ids:       Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        l_rul  = self.rul_huber(pred_rul_log, target_rul_log)
-        l_hi   = self.hi_loss(pred_hi, target_hi)
-        l_rank = self.ranking(pred_rul_log, target_rul_log, case_ids)
-        total  = self.rul_weight * l_rul + self.hi_weight * l_hi + self.rank_weight * l_rank
-        return total, l_rul, l_hi, l_rank
+        pred_hi:      torch.Tensor,
+        target_hi:    torch.Tensor,
+        case_ids:     Optional[torch.Tensor] = None,
+        elapsed:      Optional[torch.Tensor] = None,
+        late_weights: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        p_hi = pred_hi.view(-1)
+        t_hi = target_hi.view(-1)
+
+        if late_weights is not None:
+            w = late_weights.view(-1)
+            w = w / (w.mean() + 1e-9)
+            l_hi = (self.hi_loss(p_hi, t_hi) * w).mean()
+        else:
+            l_hi = self.hi_loss(p_hi, t_hi).mean()
+
+        l_hi_rank = self.hi_ranking(pred_hi, target_hi, case_ids)
+
+        l_mono = torch.tensor(0.0, device=pred_hi.device)
+        l_smooth = torch.tensor(0.0, device=pred_hi.device)
+
+        if case_ids is not None and elapsed is not None:
+            c_ids = case_ids.view(-1)
+            elap = elapsed.view(-1)
+            
+            sort_keys = c_ids.float() * 1000.0 + elap
+            sort_idx = torch.argsort(sort_keys)
+            
+            p_sorted = p_hi[sort_idx]
+            c_sorted = c_ids[sort_idx]
+            
+            same_case_mask = (c_sorted[:-1] == c_sorted[1:])
+            
+            if same_case_mask.any():
+                p_prev = p_sorted[:-1][same_case_mask]
+                p_next = p_sorted[1:][same_case_mask]
+                
+                l_mono = torch.relu(p_prev - p_next).mean()
+                l_smooth = torch.abs(p_next - p_prev).mean()
+
+        total = (
+            self.hi_weight * l_hi 
+            + self.hi_rank_weight * l_hi_rank 
+            + self.lambda1 * l_mono 
+            + self.lambda2 * l_smooth
+        )
+        return total, l_hi, l_hi_rank, l_mono, l_smooth
 
 
 def asymmetric_rul_score_np(predictions, targets) -> np.ndarray:
     """Competition A_RUL score, NumPy version for evaluation."""
     predictions = np.asarray(predictions, dtype=np.float64)
     targets = np.asarray(targets, dtype=np.float64)
-    denominator = np.maximum(np.abs(targets), 1e-6)
+    denominator = np.maximum(np.abs(targets), 1000.0)
     er = 100.0 * (targets - predictions) / denominator
     ln_half = np.log(0.5)
     exponent = np.where(
@@ -218,14 +194,14 @@ def asymmetric_rul_score_np(predictions, targets) -> np.ndarray:
     return np.exp(exponent)
 
 
-class DualHeadModel(nn.Module):
-    """Two-branch encoder + RUL head + HI head."""
+class HIModel(nn.Module):
+    """Single-head HI regression model."""
 
     def __init__(
         self,
         vibration_channels: int = 4,
         vibration_features: int = VIBRATION_FEATURES_PER_CHANNEL,
-        handcrafted_dim: int = HANDCRAFTED_DIM * (3 if HI_FEATURES_ENABLED else 1),
+        handcrafted_dim: int = AUGMENTED_HANDCRAFTED_DIM,
         vib_hidden: int = VIB_HIDDEN,
         dropout: float = DROPOUT,
     ):
@@ -278,20 +254,26 @@ class DualHeadModel(nn.Module):
             num_layers=1, batch_first=True,
         )
 
-        fusion_dim = vib_hidden * 2 + feat_hidden
+        elapsed_embed_dim = 8
+        self.elapsed_embed = nn.Sequential(
+            nn.Linear(1, elapsed_embed_dim),
+            nn.ReLU(),
+        )
+
+        fusion_dim = vib_hidden * 2 + feat_hidden + elapsed_embed_dim
         self.fusion = nn.Sequential(
             nn.Linear(fusion_dim, 96),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
-        # Two heads on top of the 96-dim shared representation.
-        self.rul_head = nn.Linear(96, 1)            # log-space RUL
-        self.hi_head = nn.Sequential(               # sigmoid HI in [0, 1]
+        self.hi_head = nn.Sequential(
             nn.Linear(96, 1),
             nn.Sigmoid(),
         )
 
-    def encode(self, x_vib: torch.Tensor, x_feat: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_vib: torch.Tensor, x_feat: torch.Tensor,
+                elapsed_frac: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Return hi_pred ∈ [0, 1].  elapsed_frac = time_sec / case_max ∈ [0, 1]."""
         b, seq, ch, fbin = x_vib.shape
 
         v = x_vib.reshape(b * seq, ch, fbin)
@@ -308,20 +290,21 @@ class DualHeadModel(nn.Module):
         _, h_feat = self.feature_encoder(f)
         h_feat = h_feat.squeeze(0)
 
-        return self.fusion(torch.cat([h_vib, h_feat], dim=1))
+        if elapsed_frac is None:
+            elapsed_frac = torch.zeros(b, 1, device=x_vib.device)
+        h_elapsed = self.elapsed_embed(elapsed_frac.view(b, 1))
 
-    def forward(self, x_vib: torch.Tensor, x_feat: torch.Tensor):
-        """Return (rul_log_pred, hi_pred). rul_log is unbounded; hi is in [0, 1]."""
-        h = self.encode(x_vib, x_feat)
-        return self.rul_head(h), self.hi_head(h)
+        h = self.fusion(torch.cat([h_vib, h_feat, h_elapsed], dim=1))
+        return self.hi_head(h)
 
 
+# ── backward-compat alias (evaluate.py / train.py에서 create_model() 사용) ──
 def create_model(
     vibration_channels: int = 4,
     vibration_features: int = VIBRATION_FEATURES_PER_CHANNEL,
-    handcrafted_dim: int = HANDCRAFTED_DIM * (3 if HI_FEATURES_ENABLED else 1),
-) -> DualHeadModel:
-    return DualHeadModel(
+    handcrafted_dim: int = AUGMENTED_HANDCRAFTED_DIM,
+) -> HIModel:
+    return HIModel(
         vibration_channels=vibration_channels,
         vibration_features=vibration_features,
         handcrafted_dim=handcrafted_dim,

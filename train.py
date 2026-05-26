@@ -1,8 +1,8 @@
-"""Train DualHeadModel (RUL + HI) with leave-one-TDMS-case-out CV.
+"""Train HI regression model with leave-one-TDMS-case-out CV.
 
-Training loss = 0.5*MSE(RUL_log) + 0.3*MSE(HI) + 0.2*PairwiseRanking
-  - No asymmetric bias → no DENORM_SCALE post-hoc correction needed.
-  - A_RUL (asymmetric metric) is reported at validation time only.
+Training loss = HI_LOSS_WEIGHT * Huber(HI) + HI_RANK_LOSS_WEIGHT * PairwiseRanking + λ1*Mono + λ2*Smooth
+  - No direct RUL regression!
+  - RUL is computed solely via Stage-2 extrapolation.
 """
 
 from __future__ import annotations
@@ -25,13 +25,14 @@ from config import (
     DEVICE,
     EARLY_STOPPING_PATIENCE,
     EPOCHS,
+    HI_FAILURE_THRESHOLD,
     HI_LOSS_WEIGHT,
+    HI_RANK_LOSS_WEIGHT,
+    LATE_LIFE_WEIGHT,
     LEARNING_RATE,
     MODELS_DIR,
     RANDOM_VAL_CASE,
-    RANKING_LOSS_WEIGHT,
     RESULTS_DIR,
-    RUL_LOSS_WEIGHT,
     SCHEDULER_T0,
     STFT_FREQ_BINS,
     STFT_NOVERLAP,
@@ -43,85 +44,116 @@ from config import (
     WEIGHT_DECAY,
     WINDOW_SIZE,
 )
+from stage2 import compute_stage2_trajectory, ema, _exp_model, _FALLBACK_RUL_CAP, _ROLLING_WINDOW
 from data_loader import load_dataset
 from model import TrainingLoss, asymmetric_rul_score_np, create_model
-
+from scipy.optimize import curve_fit
 
 MODEL_PATH = MODELS_DIR / "RUL.pt"
 PLOT_EPOCHS = frozenset({1, 3, 5, 10, 15, 20, 25, 30})
-
 
 def _make_trajectory_plot(
     true_rul: np.ndarray,
     pred_rul: np.ndarray,
     true_hi: np.ndarray,
     pred_hi: np.ndarray,
+    times: np.ndarray,
     epoch_label: str,
     save_dir: Path,
 ) -> None:
-    """4-panel trajectory plot: RUL, HI, histogram, Spearman rank scatter."""
+    """Generates 3 required plots: HI trajectory, Stage-2 fitting, RUL trajectory."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        from scipy.stats import spearmanr
     except ImportError:
         return
 
-    rho, _ = spearmanr(true_rul, pred_rul)
-    t = np.arange(len(true_rul))
-    n = len(true_rul)
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-    case_label = save_dir.parent.name  # e.g. "Train1_fold1"
-    fig.suptitle(f"Val: {case_label} — Epoch {epoch_label}  |  Spearman ρ={rho:.3f}", fontsize=12)
-
-    # 1. True vs Pred RUL (hours)
-    ax = axes[0, 0]
-    ax.plot(t, true_rul / 3600, label="True", color="C0", lw=1.5)
-    ax.plot(t, pred_rul / 3600, label="Pred", color="C1", lw=1.2, alpha=0.85)
-    ax.set_xlabel("Window index")
-    ax.set_ylabel("RUL (h)")
-    ax.set_title("True vs Pred RUL")
-    ax.legend()
-
-    # 2. HI trajectory
-    ax = axes[0, 1]
-    ax.plot(t, true_hi, label="True HI", color="C0", lw=1.5)
-    ax.plot(t, pred_hi, label="Pred HI", color="C2", lw=1.2, alpha=0.85)
+    epoch_dir = save_dir / f"epoch_{epoch_label}"
+    epoch_dir.mkdir(parents=True, exist_ok=True)
+    case_label = save_dir.name
+    
+    t = times
+    
+    # 1. HI Trajectory Plot
+    fig, ax = plt.subplots(figsize=(10, 5))
+    h_ema = ema(pred_hi, alpha=0.2)
+    h_mono = np.maximum.accumulate(h_ema)
+    
+    ax.plot(t, true_hi, label="GT HI", color="k", lw=2, linestyle="--")
+    ax.plot(t, pred_hi, label="Raw Pred HI", color="C0", alpha=0.4)
+    ax.plot(t, h_ema, label="Smoothed HI (EMA)", color="C1", alpha=0.6)
+    ax.plot(t, h_mono, label="Monotonic Filtered HI", color="C3", lw=2)
+    
     ax.set_ylim(-0.05, 1.05)
-    ax.set_xlabel("Window index")
+    ax.set_xlabel("Time (s)")
     ax.set_ylabel("HI [0, 1]")
-    ax.set_title("HI Trajectory")
+    ax.set_title(f"[{case_label}] HI Trajectory (Epoch {epoch_label})")
     ax.legend()
-
-    # 3. RUL prediction distribution
-    ax = axes[1, 0]
-    bins = min(30, max(10, n // 5))
-    ax.hist(true_rul / 3600, bins=bins, alpha=0.6, label="True", color="C0", density=True)
-    ax.hist(pred_rul / 3600, bins=bins, alpha=0.6, label="Pred", color="C1", density=True)
-    ax.set_xlabel("RUL (h)")
-    ax.set_ylabel("Density")
-    ax.set_title("RUL Distribution")
-    ax.legend()
-
-    # 4. Spearman monotonicity: true rank vs pred rank
-    ax = axes[1, 1]
-    true_rank = np.argsort(np.argsort(-true_rul))
-    pred_rank = np.argsort(np.argsort(-pred_rul))
-    ax.scatter(true_rank, pred_rank, s=6, alpha=0.4, color="C3")
-    ax.plot([0, n - 1], [0, n - 1], "k--", lw=1, alpha=0.4, label="Perfect")
-    ax.set_xlabel("True RUL rank")
-    ax.set_ylabel("Pred RUL rank")
-    ax.set_title(f"Rank Monotonicity  (ρ={rho:.3f})")
-    ax.legend(fontsize=8)
-
-    plt.tight_layout()
-    save_dir.mkdir(parents=True, exist_ok=True)
-    out = save_dir / f"epoch_{epoch_label}.png"
-    plt.savefig(out, dpi=110, bbox_inches="tight")
+    fig.tight_layout()
+    plt.savefig(epoch_dir / "hi_traj.png", dpi=120)
     plt.close(fig)
-    print(f"  [plot] {out.name}")
+
+    # 2. Stage-2 Fitting Plot (for the last window)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    if len(t) > _ROLLING_WINDOW:
+        t_fit = t[-_ROLLING_WINDOW:]
+        h_fit = h_mono[-_ROLLING_WINDOW:]
+    else:
+        t_fit = t
+        h_fit = h_mono
+        
+    t_now = t[-1]
+    t_scale = max(t_now, 1.0)
+    t_norm = t_fit / t_scale
+    bounds = ([0.0, 1e-6, -0.2], [1.0, 1.0, 0.99])
+    
+    ax.scatter(t_fit, h_fit, color="C3", label="Recent HI Points", zorder=3)
+    ax.axhline(HI_FAILURE_THRESHOLD, color="r", linestyle="--", label="Failure Threshold")
+    
+    try:
+        popt, _ = curve_fit(_exp_model, t_norm, h_fit, p0=[0.05, 1e-3, 0.0], bounds=bounds, method="trf", maxfev=20000)
+        a, b, c = popt
+        # Generate extended curve
+        t_ext_norm = np.linspace(t_fit[0]/t_scale, max(t_fit[-1]/t_scale, 2.0), 100)
+        h_ext = _exp_model(t_ext_norm, a, b, c)
+        
+        t_ext = t_ext_norm * t_scale
+        ax.plot(t_ext, h_ext, color="C2", lw=2, label="Fitted Exponential")
+        
+        # Predicted failure point
+        inner = (HI_FAILURE_THRESHOLD - c) / a
+        if inner > 0 and b > 0:
+            t_fail = (np.log(inner) / b) * t_scale
+            ax.scatter([t_fail], [HI_FAILURE_THRESHOLD], color="r", marker="*", s=200, label=f"Pred Failure (t={t_fail:.0f})")
+            ax.set_xlim(t_fit[0] * 0.9, max(t_fail * 1.1, t_now * 1.5))
+    except Exception:
+        ax.set_title("Curve Fit Failed")
+        
+    ax.set_ylim(-0.1, 1.2)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("HI")
+    ax.set_title(f"[{case_label}] Stage-2 Fitting (Epoch {epoch_label})")
+    ax.legend()
+    fig.tight_layout()
+    plt.savefig(epoch_dir / "stage2_fit.png", dpi=120)
+    plt.close(fig)
+
+    # 3. RUL Trajectory Plot
+    fig, ax = plt.subplots(figsize=(10, 5))
+    # Replace fallback caps with NaN for cleaner plotting
+    plot_pred_rul = np.where(pred_rul >= _FALLBACK_RUL_CAP * 0.9, np.nan, pred_rul)
+    
+    ax.plot(t, true_rul / 3600, label="GT RUL", color="k", lw=2, linestyle="--")
+    ax.plot(t, plot_pred_rul / 3600, label="Predicted RUL", color="C0", lw=2)
+    
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("RUL (h)")
+    ax.set_title(f"[{case_label}] RUL Trajectory (Epoch {epoch_label})")
+    ax.legend()
+    fig.tight_layout()
+    plt.savefig(epoch_dir / "rul_traj.png", dpi=120)
+    plt.close(fig)
 
 
 def _standardize(train_array: np.ndarray, val_array: np.ndarray):
@@ -137,13 +169,13 @@ def _standardize(train_array: np.ndarray, val_array: np.ndarray):
         torch.tensor(std, dtype=torch.float32),
     )
 
-
 def _tensor(arr: np.ndarray) -> torch.Tensor:
     return torch.tensor(np.ascontiguousarray(arr), dtype=torch.float32)
 
-
-def _balanced_weights(case_names: np.ndarray, sources: np.ndarray) -> torch.Tensor:
-    """1/count per case so every case contributes equally regardless of window count."""
+def _balanced_weights(
+    case_names: np.ndarray,
+    sources: np.ndarray,
+) -> torch.Tensor:
     keys = np.asarray([f"{s}::{c}" for s, c in zip(sources, case_names)])
     unique, counts = np.unique(keys, return_counts=True)
     count_map = dict(zip(unique, counts))
@@ -151,10 +183,8 @@ def _balanced_weights(case_names: np.ndarray, sources: np.ndarray) -> torch.Tens
     w = w / w.sum() * len(w)
     return torch.tensor(w, dtype=torch.double)
 
-
 def _arul(preds: np.ndarray, targets: np.ndarray) -> float:
     return float(np.mean(asymmetric_rul_score_np(preds, targets)))
-
 
 def train(
     original_dir: Path = TRAIN_DIR,
@@ -173,10 +203,6 @@ def train(
     seed: Optional[int] = None,
     include_data2: bool = True,
 ) -> list[Path]:
-    """Train DualHeadModel.
-
-    Single-fold by default. Pass full_cv=True for 4-fold leave-one-TDMS-case-out.
-    """
     if seed is not None:
         import random as _r
         _r.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
@@ -185,8 +211,7 @@ def train(
         print(f"[seed] all RNGs set to {seed}")
 
     print("=" * 72)
-    print(f"Dual-head training | seed={seed} | window={window_size} stride={stride}")
-    print(f"  loss: {RUL_LOSS_WEIGHT}*Huber(RUL_log) + {HI_LOSS_WEIGHT}*MSE(HI) + {RANKING_LOSS_WEIGHT}*PairwiseRank")
+    print(f"HI Trajectory training | seed={seed} | window={window_size} stride={stride}")
     print("=" * 72)
 
     X_vib, X_feat, hi, rul, metadata, baseline = load_dataset(
@@ -195,36 +220,19 @@ def train(
         window_size=window_size, stride=stride,
         max_samples=max_samples, use_cache=use_cache,
     )
-    print(f"Dataset: {len(hi)} windows")
-    print(f"  vib={X_vib.shape} feat={X_feat.shape}")
-    print(f"  HI range: [{hi.min():.3f}, {hi.max():.3f}]  RUL range: [{rul.min():.0f}, {rul.max():.0f}]")
-    print(metadata.groupby(["source", "case_name"]).size().to_string())
 
     sources = metadata["source"].astype(str).to_numpy()
     case_names = metadata["case_name"].astype(str).to_numpy()
     tdms_cases = sorted(np.unique(case_names[sources == "original"]).tolist())
     if not tdms_cases:
-        raise ValueError("No TDMS (source='original') cases found.")
+        raise ValueError("No TDMS cases found.")
 
     if full_cv:
         held_out_cases = tdms_cases
-        print(f"\nCV strategy: full leave-one-TDMS-case-out ({len(tdms_cases)} folds).")
     else:
         if val_case is None:
-            if RANDOM_VAL_CASE:
-                import random
-                _val_seed = seed if seed is not None else VAL_CASE_SEED
-                rng = random.Random(_val_seed)  # None → system time (truly random)
-                val_case = rng.choice(tdms_cases)
-                note = f"seed={_val_seed}" if _val_seed is not None else "non-reproducible"
-                print(f"\n[config] RANDOM_VAL_CASE=True -> picked val_case={val_case} ({note})")
-            else:
-                val_case = VAL_CASE_DEFAULT
-                print(f"\n[config] RANDOM_VAL_CASE=False -> using VAL_CASE_DEFAULT={val_case}")
-        if val_case not in tdms_cases:
-            raise ValueError(f"val_case={val_case!r} not in {tdms_cases}")
+            val_case = VAL_CASE_DEFAULT
         held_out_cases = [val_case]
-        print(f"CV strategy: SINGLE-FOLD (val_case={val_case}).")
 
     saved: list[Path] = []
     fold_summaries = []
@@ -235,30 +243,35 @@ def train(
         val_idx = np.where(val_mask)[0]
         train_idx = np.where(train_mask)[0]
         print(f"\n========== Fold {fold}/{len(held_out_cases)} (held-out: {held_out}) ==========")
-        print(f"Train={len(train_idx)} | Val={len(val_idx)}")
 
         Xv_tr, Xv_va, vib_mean, vib_std = _standardize(X_vib[train_idx], X_vib[val_idx])
         Xf_tr, Xf_va, feat_mean, feat_std = _standardize(X_feat[train_idx], X_feat[val_idx])
 
-        # RUL target in log space; HI target directly.
-        rul_tr_log = np.log1p(rul[train_idx]).astype(np.float32)
-        rul_va_log = np.log1p(rul[val_idx]).astype(np.float32)
         hi_tr = hi[train_idx].astype(np.float32)
         hi_va = hi[val_idx].astype(np.float32)
 
-        # Integer case IDs for within-case ranking loss (train only)
+        case_max_tr = np.maximum(metadata.iloc[train_idx]["case_max"].to_numpy(np.float32), 1.0)
+        case_max_va = np.maximum(metadata.iloc[val_idx]["case_max"].to_numpy(np.float32), 1.0)
+        elapsed_tr = metadata.iloc[train_idx]["time_sec"].to_numpy(np.float32) / case_max_tr
+        elapsed_va = metadata.iloc[val_idx]["time_sec"].to_numpy(np.float32) / case_max_va
+
+        life_frac_tr = metadata.iloc[train_idx]["time_sec"].to_numpy(np.float32) / case_max_tr
+        late_weight_tr = np.where(life_frac_tr >= 0.8, LATE_LIFE_WEIGHT, 1.0).astype(np.float32)
+
         tr_case_names = metadata.iloc[train_idx]["case_name"].astype(str).to_numpy()
         unique_tr_cases = sorted(np.unique(tr_case_names).tolist())
         case_to_int = {c: i for i, c in enumerate(unique_tr_cases)}
-        case_int_tr = torch.tensor(
-            [case_to_int[c] for c in tr_case_names], dtype=torch.long
-        )
+        case_int_tr = torch.tensor([case_to_int[c] for c in tr_case_names], dtype=torch.long)
+        
+        va_case_names = metadata.iloc[val_idx]["case_name"].astype(str).to_numpy()
+        case_int_va = torch.tensor([case_to_int.get(c, -1) for c in va_case_names], dtype=torch.long)
 
         train_ds = TensorDataset(
             _tensor(Xv_tr), _tensor(Xf_tr),
-            _tensor(rul_tr_log).unsqueeze(1),
             _tensor(hi_tr).unsqueeze(1),
             case_int_tr,
+            _tensor(elapsed_tr).unsqueeze(1),
+            _tensor(late_weight_tr).unsqueeze(1),
         )
         if balanced:
             w = _balanced_weights(
@@ -269,10 +282,12 @@ def train(
             train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler)
         else:
             train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+            
         val_loader = DataLoader(
             TensorDataset(_tensor(Xv_va), _tensor(Xf_va),
-                          _tensor(rul_va_log).unsqueeze(1),
-                          _tensor(hi_va).unsqueeze(1)),
+                          _tensor(hi_va).unsqueeze(1),
+                          case_int_va,
+                          _tensor(elapsed_va).unsqueeze(1)),
             batch_size=batch_size, shuffle=False,
         )
 
@@ -282,132 +297,184 @@ def train(
             vibration_features=X_vib.shape[3],
             handcrafted_dim=X_feat.shape[-1],
         ).to(device)
-        criterion = TrainingLoss()
+        criterion = TrainingLoss(lambda1=0.1, lambda2=0.01)
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=WEIGHT_DECAY)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+        
+        warmup_epochs = max(1, epochs // 5)
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-5)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
 
-        # Early stopping: maximise validation A_RUL (closer to 1.0 = better)
-        best_val_arul = -float("inf")
-        best_arul_epoch = 0
+        best_val_score = -float("inf")
+        best_epoch = 0
         best_state = None
         patience = 0
+        recent_scores: list[float] = []
         plot_dir = RESULTS_DIR / "trajectory" / f"{held_out}_fold{fold}"
-        # Pre-compute fixed val targets once
+        
+        val_meta = metadata.iloc[val_idx].reset_index(drop=True)
         ep_true_rul = rul[val_idx].astype(np.float64)
         ep_true_hi  = hi[val_idx].astype(np.float64)
-        ep_pred_rul = np.zeros_like(ep_true_rul)
-        ep_pred_hi  = np.zeros(len(val_idx), dtype=np.float64)
+        val_times_sec = val_meta["time_sec"].to_numpy(np.float64)
 
         for epoch in range(1, epochs + 1):
             model.train()
-            tr_rul = tr_hi = tr_rank = tr_tot = 0.0
-            for bv, bf, by_rul, by_hi, by_case in train_loader:
+            tr_hi = tr_hi_rank = tr_mono = tr_smooth = tr_tot = 0.0
+            for bv, bf, by_hi, by_case, by_elapsed, by_weight in train_loader:
                 bv, bf = bv.to(device), bf.to(device)
-                by_rul, by_hi = by_rul.to(device), by_hi.to(device)
+                by_hi = by_hi.to(device)
                 by_case = by_case.to(device)
+                by_elapsed = by_elapsed.to(device)
+                by_weight = by_weight.to(device)
+                
                 optimizer.zero_grad()
-                pred_rul, pred_hi = model(bv, bf)
-                loss, l_rul, l_hi, l_rank = criterion(pred_rul, pred_hi, by_rul, by_hi, by_case)
+                pred_hi = model(bv, bf, by_elapsed)
+                loss, l_hi, l_hi_rank, l_mono, l_smooth = criterion(pred_hi, by_hi, by_case, by_elapsed, by_weight)
+                
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-                n = by_rul.size(0)
-                tr_rul += l_rul.item() * n
-                tr_hi += l_hi.item() * n
-                tr_rank += l_rank.item() * n
-                tr_tot += loss.item() * n
+                
+                n = by_hi.size(0)
+                tr_hi      += l_hi.item()      * n
+                tr_hi_rank += l_hi_rank.item() * n
+                tr_mono    += l_mono.item()    * n
+                tr_smooth  += l_smooth.item()  * n
+                tr_tot     += loss.item()      * n
 
             model.eval()
-            va_rul = va_hi = va_rank = va_tot = 0.0
-            _ep_rul_log, _ep_hi = [], []
+            va_hi = va_hi_rank = va_mono = va_smooth = va_tot = 0.0
+            _ep_hi = []
             with torch.no_grad():
-                for bv, bf, by_rul, by_hi in val_loader:
+                for bv, bf, by_hi, by_case, by_elapsed in val_loader:
                     bv, bf = bv.to(device), bf.to(device)
-                    by_rul, by_hi = by_rul.to(device), by_hi.to(device)
-                    pred_rul_b, pred_hi_b = model(bv, bf)
-                    loss, l_rul, l_hi, l_rank = criterion(pred_rul_b, pred_hi_b, by_rul, by_hi)
-                    n = by_rul.size(0)
-                    va_rul += l_rul.item() * n
-                    va_hi += l_hi.item() * n
-                    va_rank += l_rank.item() * n
-                    va_tot += loss.item() * n
-                    _ep_rul_log.append(np.array(pred_rul_b.squeeze(1).cpu().tolist(), dtype=np.float32))
+                    by_hi = by_hi.to(device)
+                    by_case = by_case.to(device)
+                    by_elapsed = by_elapsed.to(device)
+                    
+                    pred_hi_b = model(bv, bf, by_elapsed)
+                    loss, l_hi, l_hi_rank, l_mono, l_smooth = criterion(pred_hi_b, by_hi, by_case, by_elapsed, None)
+                    
+                    n = by_hi.size(0)
+                    va_hi      += l_hi.item()      * n
+                    va_hi_rank += l_hi_rank.item() * n
+                    va_mono    += l_mono.item()    * n
+                    va_smooth  += l_smooth.item()  * n
+                    va_tot     += loss.item()      * n
                     _ep_hi.append(np.array(pred_hi_b.squeeze(1).cpu().tolist(), dtype=np.float32))
-            n_tr, n_va = len(train_loader.dataset), len(val_loader.dataset)
-            tr_rul /= n_tr; tr_hi /= n_tr; tr_rank /= n_tr; tr_tot /= n_tr
-            va_rul /= n_va; va_hi /= n_va; va_rank /= n_va; va_tot /= n_va
-            scheduler.step()
-            # Convert log-preds → seconds for A_RUL and plots
-            ep_pred_rul = np.maximum(np.expm1(np.clip(np.concatenate(_ep_rul_log), 0.0, 11.5)), 0.0)
-            ep_pred_hi  = np.concatenate(_ep_hi).astype(np.float64)
-            epoch_arul  = _arul(ep_pred_rul, ep_true_rul)
 
-            # Early stopping: maximise A_RUL — this is the competition metric.
-            if epoch_arul > best_val_arul:
-                best_val_arul = epoch_arul
-                best_arul_epoch = epoch
+            n_tr, n_va = len(train_loader.dataset), len(val_loader.dataset)
+            tr_hi /= n_tr; tr_hi_rank /= n_tr; tr_mono /= n_tr; tr_smooth /= n_tr; tr_tot /= n_tr
+            va_hi /= n_va; va_hi_rank /= n_va; va_mono /= n_va; va_smooth /= n_va; va_tot /= n_va
+            scheduler.step()
+
+            ep_pred_hi  = np.concatenate(_ep_hi).astype(np.float64)
+            
+            s2_rul = compute_stage2_trajectory(val_times_sec, ep_pred_hi, HI_FAILURE_THRESHOLD)
+            
+            # --- STAGE-2 STABILITY MONITORING ---
+            # 1. RUL Stability
+            valid_rul_idx = np.where(s2_rul < 199_999)[0]
+            rul_stability = float(np.std(np.diff(s2_rul[valid_rul_idx]))) if len(valid_rul_idx) > 1 else 10000.0
+            
+            # 2. HI Monotonicity (raw pred)
+            neg_diffs = float(np.sum(np.diff(ep_pred_hi) < 0))
+            
+            # 3. Fit Success Ratio
+            num_rejected = len(s2_rul) - len(valid_rul_idx)
+            fit_success_ratio = 1.0 - (num_rejected / max(1, len(s2_rul)))
+            
+            # 4. HI MAE
+            hi_mae = float(np.mean(np.abs(ep_pred_hi - ep_true_hi)))
+            
+            # 5. Late-life A_RUL
+            n_val = len(ep_true_rul)
+            n_late = max(1, n_val // 10)
+            late_arul = _arul(s2_rul[-n_late:], ep_true_rul[-n_late:])
+
+            # Checkpoint Selection Score (Prioritizing Stability & Physics)
+            # Higher score is better
+            score = (
+                - hi_mae * 10.0 
+                - neg_diffs * 0.01 
+                - rul_stability * 0.0001 
+                + fit_success_ratio * 2.0 
+                + late_arul * 1.0
+            )
+
+            recent_scores.append(score)
+            if len(recent_scores) > 3:
+                recent_scores.pop(0)
+            smoothed_score = float(np.mean(recent_scores))
+
+            if smoothed_score > best_val_score:
+                best_val_score = smoothed_score
+                best_epoch = epoch
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 patience = 0
-                _make_trajectory_plot(ep_true_rul, ep_pred_rul, ep_true_hi, ep_pred_hi, "best", plot_dir)
+                _make_trajectory_plot(ep_true_rul, s2_rul, ep_true_hi, ep_pred_hi, val_times_sec, "best", plot_dir)
             else:
                 patience += 1
                 if patience >= EARLY_STOPPING_PATIENCE:
-                    print(f"  [early-stop] epoch={epoch}  best_A_RUL={best_val_arul:.4f} @ ep{best_arul_epoch}")
-                    _make_trajectory_plot(ep_true_rul, ep_pred_rul, ep_true_hi, ep_pred_hi, "last", plot_dir)
+                    print(f"  [early-stop] epoch={epoch}  best_score={best_val_score:.4f} @ ep{best_epoch}")
+                    _make_trajectory_plot(ep_true_rul, s2_rul, ep_true_hi, ep_pred_hi, val_times_sec, "last", plot_dir)
                     break
 
-            # Trajectory plots at fixed epochs
             if epoch in PLOT_EPOCHS:
-                _make_trajectory_plot(ep_true_rul, ep_pred_rul, ep_true_hi, ep_pred_hi,
-                                      str(epoch).zfill(2), plot_dir)
+                _make_trajectory_plot(ep_true_rul, s2_rul, ep_true_hi, ep_pred_hi, val_times_sec, str(epoch).zfill(2), plot_dir)
 
             if epoch % 5 == 0 or epoch == 1:
-                print(f"  epoch {epoch:03d}/{epochs} | "
-                      f"tr(rul={tr_rul:.4f} hi={tr_hi:.4f} rank={tr_rank:.4f} tot={tr_tot:.4f}) "
-                      f"va(rul={va_rul:.4f} hi={va_hi:.4f} rank={va_rank:.4f} tot={va_tot:.4f}) "
-                      f"A_RUL={epoch_arul:.4f} patience={patience}")
+                print(f"  epoch {epoch:03d}/{epochs} | va(tot={va_tot:.4f} hi={va_hi:.4f} mono={va_mono:.4f} sm={va_smooth:.4f})")
+                print(f"    -> Metric: HI_MAE={hi_mae:.3f} | NegDiffs={neg_diffs:.0f} | RUL_Std={rul_stability:.0f} | FitRatio={fit_success_ratio:.2f} | Score={score:.3f}")
 
         if best_state is not None:
             model.load_state_dict(best_state)
 
-        # "last" plot when training completed all epochs without early-stop
         if patience < EARLY_STOPPING_PATIENCE:
-            _make_trajectory_plot(ep_true_rul, ep_pred_rul, ep_true_hi, ep_pred_hi, "last", plot_dir)
+            _make_trajectory_plot(ep_true_rul, s2_rul, ep_true_hi, ep_pred_hi, val_times_sec, "last", plot_dir)
 
-        print(f"  [best A_RUL={best_val_arul:.4f} @ epoch={best_arul_epoch}]")
+        print(f"  [best Score={best_val_score:.4f} @ epoch={best_epoch}]")
 
-        # Inference on val set
+        # Final Evaluation
         model.eval()
-        rul_log_preds, hi_preds = [], []
+        hi_preds = []
         with torch.no_grad():
-            for bv, bf, _, _ in val_loader:
-                pr, ph = model(bv.to(device), bf.to(device))
-                rul_log_preds.append(np.array(pr.squeeze(1).cpu().tolist(), dtype=np.float32))
+            for bv, bf, _, _, be in val_loader:
+                ph = model(bv.to(device), bf.to(device), be.to(device))
                 hi_preds.append(np.array(ph.squeeze(1).cpu().tolist(), dtype=np.float32))
-        rul_log_preds = np.concatenate(rul_log_preds).astype(np.float64)
         hi_preds = np.concatenate(hi_preds).astype(np.float64)
 
-        # RUL head: log → seconds (no post-hoc scaling).
-        rul_pred = np.maximum(np.expm1(np.clip(rul_log_preds, 0.0, 11.5)), 0.0)
         true_rul = rul[val_idx].astype(np.float64)
         true_hi = hi[val_idx].astype(np.float64)
-
-        arul = _arul(rul_pred, true_rul)
-        rul_mae = float(np.mean(np.abs(rul_pred - true_rul)))
+        
         hi_mae = float(np.mean(np.abs(hi_preds - true_hi)))
-        print("\nValidation:")
-        print(f"  RUL  MAE={rul_mae:7.0f}  A_RUL={arul:.4f}")
-        print(f"  HI   MAE={hi_mae:.4f}  (auxiliary head)")
+
+        s2_rul = compute_stage2_trajectory(val_times_sec, hi_preds, HI_FAILURE_THRESHOLD)
+        s2_arul_full = _arul(s2_rul, true_rul)
+        s2_arul_late = _arul(s2_rul[-n_late:], true_rul[-n_late:])
+        s2_arul_last = _arul(s2_rul[-1:], true_rul[-1:])
+        s2_rul_mae   = float(np.mean(np.abs(s2_rul - true_rul)))
+        
+        valid_rul_idx = np.where(s2_rul < 199_999)[0]
+        rul_stability = float(np.std(np.diff(s2_rul[valid_rul_idx]))) if len(valid_rul_idx) > 1 else 10000.0
+
+        print("\nValidation Results:")
+        print(f"  HI MAE = {hi_mae:.4f} | RUL Stability (std) = {rul_stability:.1f}")
+        print(f"  [Stage-2] MAE={s2_rul_mae:7.0f} | A_RUL(full)={s2_arul_full:.4f} | A_RUL(last)={s2_arul_last:.4f}")
+
         fold_summaries.append({"fold": fold, "held_out": held_out,
-                               "rul_mae": rul_mae, "a_rul": arul,
-                               "hi_mae": hi_mae})
+                               "hi_mae": hi_mae,
+                               "s2_a_rul": s2_arul_full,
+                               "s2_last_arul": s2_arul_last,
+                               "s2_rul_mae": s2_rul_mae,
+                               "rul_stability": rul_stability})
 
         seed_tag = f"_seed{seed}" if seed is not None else ""
         fold_path = Path(str(model_path).replace(".pt", f"{seed_tag}_fold{fold}.pt"))
         fold_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
-                "model_state_dict": model.state_dict(),   # best A_RUL weights
+                "model_state_dict": model.state_dict(),
                 "window_size": window_size,
                 "stride": stride,
                 "stft_nperseg": STFT_NPERSEG,
@@ -421,48 +488,27 @@ def train(
                 "feature_mean": feat_mean,
                 "feature_std": feat_std,
                 "degradation_baseline": baseline,
-                "denorm_scale": 1.0,
-                "best_arul": best_val_arul,
-                "best_arul_epoch": best_arul_epoch,
+                "best_score": best_val_score,
+                "best_epoch": best_epoch,
                 "fold_summary": fold_summaries[-1],
                 "seed": seed,
             },
             fold_path,
         )
-        print(f"Saved {fold_path}  (best A_RUL={best_val_arul:.4f} @ ep{best_arul_epoch})")
-        saved.append(fold_path)
-
-        # Save per-fold OOF predictions
-        val_meta = metadata.iloc[val_idx].reset_index(drop=True)
-        oof_df = val_meta.copy()
-        oof_df["rul_true"] = true_rul
-        oof_df["rul_pred"] = rul_pred
-        oof_df["hi_true"] = true_hi
-        oof_df["hi_pred"] = hi_preds
-        oof_df["fold"] = fold
-        oof_df["held_out_case"] = held_out
-        oof_path = Path(str(fold_path).replace(".pt", "_oof.parquet"))
-        try:
-            oof_df.to_parquet(oof_path, index=False)
-        except Exception:
-            oof_path = Path(str(oof_path).replace(".parquet", ".csv"))
-            oof_df.to_csv(oof_path, index=False)
-        print(f"Saved OOF predictions {oof_path}")
+        print(f"Saved {fold_path}")
 
     print("\nFold summary:")
     for s in fold_summaries:
         print(f"  fold {s['fold']:>2} ({s['held_out']:>10}): "
-              f"RUL_MAE={s['rul_mae']:7.0f}  A_RUL={s['a_rul']:.4f}  HI_MAE={s['hi_mae']:.4f}")
-    if len(fold_summaries) > 1:
-        avg_arul = np.mean([s["a_rul"] for s in fold_summaries])
-        avg_rul_mae = np.mean([s["rul_mae"] for s in fold_summaries])
-        avg_hi_mae = np.mean([s["hi_mae"] for s in fold_summaries])
-        print(f"  AVERAGE: A_RUL={avg_arul:.4f}  RUL_MAE={avg_rul_mae:.0f}  HI_MAE={avg_hi_mae:.4f}")
+              f"HI_MAE={s['hi_mae']:.4f}  "
+              f"RUL_Stability={s['rul_stability']:.1f}  "
+              f"[S2] RUL_MAE={s['s2_rul_mae']:7.0f}  "
+              f"A_RUL={s['s2_a_rul']:.4f}")
     return saved
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Train dual-head (RUL + HI aux) model")
+    p = argparse.ArgumentParser(description="Train single-head HI trajectory model")
     p.add_argument("--original-dir", type=Path, default=TRAIN_DIR)
     p.add_argument("--data2-dir", type=Path, default=DATA2_DIR)
     p.add_argument("--model-path", type=Path, default=MODEL_PATH)
@@ -490,7 +536,6 @@ def main() -> None:
         val_case=args.val_case, seed=args.seed,
         include_data2=not args.no_data2,
     )
-
 
 if __name__ == "__main__":
     main()

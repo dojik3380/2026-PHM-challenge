@@ -1,13 +1,10 @@
-"""Ensemble inference on data/Test using DualHead fold checkpoints.
+"""Ensemble inference on data/Test using Single-Head fold checkpoints.
 
 For each Test case:
   1. Build all sliding windows.
-  2. Run each fold's model; collect RUL-head log predictions.
-  3. Ensemble (mean) the log predictions across folds.
-  4. expm1 -> seconds -> multiply by DENORM_SCALE for conservative bias.
-  5. Report RUL at the LAST window of the case.
-
-The HI head is auxiliary and ignored at inference.
+  2. Run each fold's model; collect HI predictions.
+  3. Ensemble (mean) the HI predictions across folds.
+  4. Pass ensembled HI trajectory to Stage-2 curve fitting to get final RUL.
 """
 
 from __future__ import annotations
@@ -20,7 +17,8 @@ import numpy as np
 import pandas as pd
 import torch
 
-from config import CALIBRATION_SHRINK, DENORM_SCALE, DEVICE, RESULTS_DIR, TEAM_NAME, TEST_DIR, WINDOW_SIZE
+from config import CALIBRATION_SHRINK, DEVICE, HI_FAILURE_THRESHOLD, RESULTS_DIR, TEAM_NAME, TEST_DIR, WINDOW_SIZE
+from stage2 import fit_stage2_rul
 from data_loader import load_inference_dataset
 from model import create_model
 from train import MODEL_PATH
@@ -58,18 +56,23 @@ def _load_fold(ckpt_path: Path, device: torch.device):
 
 
 def _predict(model: torch.nn.Module, X_vib: np.ndarray, X_feat: np.ndarray,
-             device: torch.device, batch_size: int = 16) -> tuple[np.ndarray, np.ndarray]:
-    rul_log, hi = [], []
+             device: torch.device, batch_size: int = 16,
+             elapsed_frac: Optional[np.ndarray] = None) -> np.ndarray:
+    hi = []
     n = len(X_vib)
     with torch.no_grad():
         for start in range(0, n, batch_size):
             end = min(start + batch_size, n)
             vb = torch.from_numpy(np.ascontiguousarray(X_vib[start:end])).to(device)
             fb = torch.from_numpy(np.ascontiguousarray(X_feat[start:end])).to(device)
-            pr, ph = model(vb, fb)
-            rul_log.append(np.array(pr.squeeze(1).cpu().tolist(), dtype=np.float32))
+            ef = None
+            if elapsed_frac is not None:
+                ef = torch.tensor(
+                    elapsed_frac[start:end].reshape(-1, 1), dtype=torch.float32
+                ).to(device)
+            ph = model(vb, fb, ef)
             hi.append(np.array(ph.squeeze(1).cpu().tolist(), dtype=np.float32))
-    return np.concatenate(rul_log, axis=0), np.concatenate(hi, axis=0)
+    return np.concatenate(hi, axis=0)
 
 
 def evaluate_test(
@@ -105,44 +108,44 @@ def evaluate_test(
     print(f"Inference dataset: vib={X_vib_raw.shape} feat={X_feat_raw.shape}")
     print(metadata.groupby("case_name").size().to_string())
 
+    elapsed_frac = (
+        metadata["time_sec"].to_numpy(np.float32)
+        / np.maximum(metadata["case_max"].to_numpy(np.float32), 1.0)
+    )
+
     device = torch.device(DEVICE)
-    fold_rul_log: list[np.ndarray] = []
     fold_hi: list[np.ndarray] = []
     for fp in fold_paths:
         model, ckpt = _load_fold(fp, device)
         X_vib = _standardize(X_vib_raw, ckpt["vibration_mean"], ckpt["vibration_std"])
         X_feat = _standardize(X_feat_raw, ckpt["feature_mean"], ckpt["feature_std"])
-        rul_log, hi = _predict(model, X_vib, X_feat, device)
-        rul_real = np.expm1(np.clip(rul_log, 0.0, 11.5))
-        print(f"  {fp.name}: RUL seconds mean={rul_real.mean():.0f} range=[{rul_real.min():.0f}, {rul_real.max():.0f}]  "
-              f"HI mean={hi.mean():.3f}")
-        fold_rul_log.append(rul_log)
+        hi = _predict(model, X_vib, X_feat, device, elapsed_frac=elapsed_frac)
+        print(f"  {fp.name}: HI mean={hi.mean():.3f}")
         fold_hi.append(hi)
 
-    # Ensemble in log space, then expm1, then DENORM_SCALE shrinkage.
-    rul_log_ens = np.mean(np.stack(fold_rul_log, axis=0), axis=0)
-    rul_seconds = np.expm1(np.clip(rul_log_ens, 0.0, 11.5))
-    rul_final = np.maximum(rul_seconds * CALIBRATION_SHRINK, 0.0)
     hi_ens = np.mean(np.stack(fold_hi, axis=0), axis=0)
-    print(f"\n[ensemble] RUL mean={rul_seconds.mean():.0f}  after CALIBRATION_SHRINK({CALIBRATION_SHRINK})={rul_final.mean():.0f}")
+    print(f"\n[ensemble] HI mean={hi_ens.mean():.3f}")
 
-    # Report RUL at the LAST window per case.
+    # Stage 2: 케이스별 HI 궤적 → 지수 피팅 → RUL 외삽
     results = []
     for case_name in sorted(metadata["case_name"].unique()):
         mask = (metadata["case_name"] == case_name).to_numpy()
-        case_meta = metadata[mask].sort_values("end_timestep").reset_index(drop=True)
-        # Last-window index in the (concatenated) inference arrays.
-        last_pos = int(case_meta["end_timestep"].idxmax()) if False else int(np.argmax(case_meta["end_timestep"].to_numpy()))
-        last_global = np.where(mask)[0][np.argsort(case_meta.index.to_numpy())][last_pos]
-        # The above is fragile; simpler: take the global window with the largest end_timestep within this case.
         case_global_idx = np.where(mask)[0]
-        case_end_ts = metadata.iloc[case_global_idx]["end_timestep"].to_numpy()
-        last_global = case_global_idx[int(np.argmax(case_end_ts))]
-        rul_pred = float(rul_final[last_global])
+
+        # time_sec 기준 정렬 (fit_stage2_rul 내부에서도 정렬하지만 명시적으로)
+        sort_order      = np.argsort(metadata.iloc[case_global_idx]["time_sec"].to_numpy())
+        sorted_idx      = case_global_idx[sort_order]
+        case_times      = metadata.iloc[sorted_idx]["time_sec"].to_numpy(np.float64)
+        case_hi         = hi_ens[sorted_idx]
+
+        rul_s2 = fit_stage2_rul(case_times, case_hi, failure_threshold=HI_FAILURE_THRESHOLD)
+        rul_s2 = float(max(rul_s2 * CALIBRATION_SHRINK, 0.0))
+
+        last_global = sorted_idx[-1]
         results.append({
             "File": case_name,
-            "RUL_Score": int(round(rul_pred)),
-            "rul_seconds_raw": float(rul_seconds[last_global]),
+            "RUL_Score": int(round(rul_s2)),
+            "rul_seconds_raw": rul_s2,
             "hi_last": float(hi_ens[last_global]),
             "n_windows": int(mask.sum()),
         })
@@ -162,7 +165,7 @@ def evaluate_test(
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Dual-head ensemble inference on TDMS Test set")
+    p = argparse.ArgumentParser(description="Single-head ensemble inference on TDMS Test set")
     p.add_argument("--test-dir", type=Path, default=TEST_DIR)
     p.add_argument("--model-path", type=Path, default=MODEL_PATH)
     p.add_argument("--output", type=Path, default=None,

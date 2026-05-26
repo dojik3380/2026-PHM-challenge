@@ -69,7 +69,7 @@ HANDCRAFTED_FEATURES = (
 HANDCRAFTED_DIM = len(HANDCRAFTED_FEATURES)
 DEGRADATION_BASELINE_TIMESTEPS = 10                # first N timesteps used as healthy baseline
 HI_FEATURES_ENABLED = True                          # 10-dim -> 30-dim: [rel, cummax_rel, damage_rel]
-AUGMENTED_HANDCRAFTED_DIM = HANDCRAFTED_DIM * 3 if HI_FEATURES_ENABLED else HANDCRAFTED_DIM
+AUGMENTED_HANDCRAFTED_DIM = (HANDCRAFTED_DIM * 3 + 1) if HI_FEATURES_ENABLED else HANDCRAFTED_DIM
 
 
 # HI label generation ---------------------------------------------------------
@@ -81,10 +81,11 @@ AUGMENTED_HANDCRAFTED_DIM = HANDCRAFTED_DIM * 3 if HI_FEATURES_ENABLED else HAND
 #              short/long-lifetime outlier problem (Train3 / Train4) that
 #              time-based labels suffer from.
 #   "hybrid" : 0.5 * linear + 0.5 * damage                (best of both)
-HI_LABEL_MODE = "composite"
+HI_LABEL_MODE = "exponential"
+HI_ALPHA = 4.0               # degradation acceleration: HI(t) = (e^(α·t/T)-1)/(e^α-1)
 HI_LABEL_POWER = 2.0
 HI_DAMAGE_SCALE = 5.0        # RMS growth ratio that maps to HI=1.0 (tanh saturation)
-HI_FAILURE_THRESHOLD = 0.9   # HI value treated as end-of-life in stage 2
+HI_FAILURE_THRESHOLD = 1.0   # Stage 2 failure threshold (exponential label ends at 1.0)
 HI_SMOOTH_WINDOW = 11        # moving-average window for cumulative-damage HI smoothing
 
 
@@ -138,15 +139,16 @@ VAL_CASE_SEED = None   # None → truly random each run; set an int for reproduc
 
 
 # Loss ------------------------------------------------------------------------
-# Training loss = 0.5*MSE(RUL_log) + 0.3*MSE(HI) + 0.2*PairwiseRanking
-#   - RUL MSE (log space): unbiased regression — no asymmetric bias, no DENORM hack.
-#   - HI MSE: auxiliary degradation supervision.
-#   - PairwiseRanking: enforces pred_rul[i] > pred_rul[j] when true_rul[i] > true_rul[j].
+# Training loss (Stage-1 HI prediction only — RUL comes from Stage-2 curve fitting)
+#   L = HI_LOSS_WEIGHT * Huber(HI, δ=HUBER_DELTA, late×LATE_LIFE_WEIGHT) + HI_RANK_LOSS_WEIGHT * HIPairwiseRanking
+#   - Huber(HI): 후반부 20% 구간 W_i=LATE_LIFE_WEIGHT 가중치 적용 (고장 직전 궤적 정밀도 향상)
+#   - HIPairwiseRanking: pred_hi[후기] > pred_hi[전기] 단조성 강제 (상수 붕괴 방지)
 #
-# Asymmetric metric (A_RUL) is used ONLY in validation reporting, not in training.
-RUL_LOSS_WEIGHT     = 0.50
-HI_LOSS_WEIGHT      = 0.40
-RANKING_LOSS_WEIGHT = 0.10
+# A_RUL (Stage-2 기반) is used ONLY in validation reporting, not in training.
+HI_LOSS_WEIGHT      = 0.75
+HI_RANK_LOSS_WEIGHT = 0.25
+HUBER_DELTA         = 0.3
+LATE_LIFE_WEIGHT    = 8.0
 
 # A_RUL evaluation penalty scales — evaluation only, not used in training loss.
 OVER_EST_PENALTY_SCALE  = 20.0
