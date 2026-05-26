@@ -122,22 +122,22 @@ def _spectral_peak_in_band(
     return float(np.max(spectrum[mask]))
 
 
-def estimate_shaft_freq_hz(
+def estimate_rpm_from_fft(
     signal: np.ndarray,
     sampling_rate: int = SAMPLING_RATE,
     min_rpm: float = BEARING_RPM_MIN,
     max_rpm: float = BEARING_RPM_MAX,
     default_rpm: float = BEARING_RPM_DEFAULT,
 ) -> float:
-    """Estimate shaft (1×) frequency in Hz from vibration spectrum using harmonic peak scoring.
+    """Estimate shaft RPM from vibration spectrum using harmonic peak scoring.
 
     Mirrors estimationRPM.estimate_rpm_from_spectrum but operates on a single
-    pre-read signal array and returns Hz (not RPM). Falls back to default_rpm
+    pre-read signal array and returns RPM (not Hz). Falls back to default_rpm
     when the signal is too short or no plausible peak is found.
     """
     freqs, spectrum = _full_rfft(signal, sampling_rate)
     if freqs.size < 2:
-        return default_rpm / 60.0
+        return default_rpm
 
     min_hz, max_hz = min_rpm / 60.0, max_rpm / 60.0
     mask = (freqs >= min_hz) & (freqs <= max_hz)
@@ -145,7 +145,7 @@ def estimate_shaft_freq_hz(
     search_spectrum = spectrum[mask]
 
     if candidate_freqs.size == 0:
-        return default_rpm / 60.0
+        return default_rpm
 
     peak_indices, _ = find_peaks(search_spectrum)
     if peak_indices.size == 0:
@@ -164,7 +164,8 @@ def estimate_shaft_freq_hz(
             best_score = score
             best_freq = f
 
-    return best_freq
+    real_rpm = best_freq * 60.0
+    return real_rpm
 
 
 def bearing_fault_amplitudes(
@@ -183,9 +184,11 @@ def bearing_fault_amplitudes(
 
     # Need at least 1 second to resolve shaft frequency (min ~10 Hz at 600 RPM)
     if arr.size < sampling_rate:
-        shaft_hz = BEARING_RPM_DEFAULT / 60.0
+        real_rpm = BEARING_RPM_DEFAULT
     else:
-        shaft_hz = estimate_shaft_freq_hz(arr, sampling_rate)
+        real_rpm = estimate_rpm_from_fft(arr, sampling_rate)
+        
+    shaft_hz = real_rpm / 60.0
 
     freqs, spectrum = _full_rfft(arr, sampling_rate)
     n = max(arr.size, 1)
@@ -224,9 +227,11 @@ def shaft_harmonic_amplitudes(
     arr = arr[np.isfinite(arr)]
 
     if arr.size < sampling_rate:
-        shaft_hz = BEARING_RPM_DEFAULT / 60.0
+        real_rpm = BEARING_RPM_DEFAULT
     else:
-        shaft_hz = estimate_shaft_freq_hz(arr, sampling_rate)
+        real_rpm = estimate_rpm_from_fft(arr, sampling_rate)
+        
+    shaft_hz = real_rpm / 60.0
 
     freqs, spectrum = _full_rfft(arr, sampling_rate)
     n = max(arr.size, 1)

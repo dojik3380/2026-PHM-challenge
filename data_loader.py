@@ -770,7 +770,21 @@ def load_dataset(
             r["vib"], aug_feat, r["feat"], r["times"], r["case_max"],
             r["case_name"], r["source"], window_size, stride, max_samples,
         )
-        vibs.append(Xv); feats.append(Xf); his.append(hi); ruls.append(rul); metas.append(m)
+        
+        # Per-case local normalization (Degradation Delta)
+        n_base = min(10, Xv.shape[0])
+        if n_base > 0:
+            local_mean_v = Xv[:n_base].reshape(-1, Xv.shape[2], Xv.shape[3]).mean(axis=0)
+            local_std_v = np.maximum(Xv[:n_base].reshape(-1, Xv.shape[2], Xv.shape[3]).std(axis=0), 1e-8)
+            Xv = (Xv - local_mean_v) / local_std_v
+            
+            local_mean_f = Xf[:n_base].reshape(-1, Xf.shape[2], Xf.shape[3]).mean(axis=0)
+            local_std_f = np.maximum(Xf[:n_base].reshape(-1, Xf.shape[2], Xf.shape[3]).std(axis=0), 1e-8)
+            Xf = (Xf - local_mean_f) / local_std_f
+            
+        vibs.append(Xv.astype(np.float32))
+        feats.append(Xf.astype(np.float32))
+        his.append(hi); ruls.append(rul); metas.append(m)
 
     return (
         np.concatenate(vibs, axis=0),
@@ -816,11 +830,14 @@ def load_inference_dataset(
         n = len(vib)
         if n < window_size:
             raise ValueError(f"case {case_name}: only {n} TDMS chunks, need >= window_size={window_size}")
+        case_vibs = []
+        case_feats = []
+        case_metas = []
         for start in range(0, n - window_size + 1, stride):
             end = start + window_size
-            vibs.append(vib[start:end][None, ...])
-            feats.append(aug_feat[start:end][None, ...])
-            metas.append({
+            case_vibs.append(vib[start:end])
+            case_feats.append(aug_feat[start:end])
+            case_metas.append({
                 "case_name": case_name,
                 "source": "original_inference",
                 "start_timestep": start,
@@ -829,6 +846,24 @@ def load_inference_dataset(
                 "num_timesteps_total": n,
                 "case_max": float(times[-1]),
             })
+            
+        Xv = np.asarray(case_vibs, dtype=np.float32)
+        Xf = np.asarray(case_feats, dtype=np.float32)
+        
+        # Per-case local normalization (Degradation Delta)
+        n_base = min(10, Xv.shape[0])
+        if n_base > 0:
+            local_mean_v = Xv[:n_base].reshape(-1, Xv.shape[2], Xv.shape[3]).mean(axis=0)
+            local_std_v = np.maximum(Xv[:n_base].reshape(-1, Xv.shape[2], Xv.shape[3]).std(axis=0), 1e-8)
+            Xv = (Xv - local_mean_v) / local_std_v
+            
+            local_mean_f = Xf[:n_base].reshape(-1, Xf.shape[2], Xf.shape[3]).mean(axis=0)
+            local_std_f = np.maximum(Xf[:n_base].reshape(-1, Xf.shape[2], Xf.shape[3]).std(axis=0), 1e-8)
+            Xf = (Xf - local_mean_f) / local_std_f
+
+        vibs.append(Xv)
+        feats.append(Xf)
+        metas.extend(case_metas)
 
     return (
         np.concatenate(vibs, axis=0).astype(np.float32),

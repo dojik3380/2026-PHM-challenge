@@ -44,10 +44,15 @@ from config import (
     WEIGHT_DECAY,
     WINDOW_SIZE,
 )
-from stage2 import compute_stage2_trajectory, ema, _exp_model, _FALLBACK_RUL_CAP, _ROLLING_WINDOW
+from stage2 import (
+    _FALLBACK_RUL_CAP,
+    _RUL_BEFORE_FDP,
+    compute_stage2_trajectory,
+    kalman_filter_hi,
+    _FDP_THRESHOLD,
+)
 from data_loader import load_dataset
 from model import TrainingLoss, asymmetric_rul_score_np, create_model
-from scipy.optimize import curve_fit
 
 MODEL_PATH = MODELS_DIR / "RUL.pt"
 PLOT_EPOCHS = frozenset({1, 3, 5, 10, 15, 20, 25, 30})
@@ -72,19 +77,17 @@ def _make_trajectory_plot(
     epoch_dir = save_dir / f"epoch_{epoch_label}"
     epoch_dir.mkdir(parents=True, exist_ok=True)
     case_label = save_dir.name
-    
+
     t = times
-    
+    pred_hi = np.clip(pred_hi, 0.0, 1.0)
+    hi_raw_kf = kalman_filter_hi(pred_hi)
+    hi_kf = np.maximum.accumulate(hi_raw_kf)
+
     # 1. HI Trajectory Plot
     fig, ax = plt.subplots(figsize=(10, 5))
-    h_ema = ema(pred_hi, alpha=0.2)
-    h_mono = np.maximum.accumulate(h_ema)
-    
     ax.plot(t, true_hi, label="GT HI", color="k", lw=2, linestyle="--")
     ax.plot(t, pred_hi, label="Raw Pred HI", color="C0", alpha=0.4)
-    ax.plot(t, h_ema, label="Smoothed HI (EMA)", color="C1", alpha=0.6)
-    ax.plot(t, h_mono, label="Monotonic Filtered HI", color="C3", lw=2)
-    
+    ax.plot(t, hi_kf, label="KF Filtered (Monotonic) HI", color="C1", lw=2)
     ax.set_ylim(-0.05, 1.05)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("HI [0, 1]")
@@ -94,47 +97,57 @@ def _make_trajectory_plot(
     plt.savefig(epoch_dir / "hi_traj.png", dpi=120)
     plt.close(fig)
 
-    # 2. Stage-2 Fitting Plot (for the last window)
+    # 2. Stage-2 Fitting Plot
     fig, ax = plt.subplots(figsize=(10, 5))
-    if len(t) > _ROLLING_WINDOW:
-        t_fit = t[-_ROLLING_WINDOW:]
-        h_fit = h_mono[-_ROLLING_WINDOW:]
-    else:
-        t_fit = t
-        h_fit = h_mono
-        
-    t_now = t[-1]
-    t_scale = max(t_now, 1.0)
-    t_norm = t_fit / t_scale
-    bounds = ([0.0, 1e-6, -0.2], [1.0, 1.0, 0.99])
-    
-    ax.scatter(t_fit, h_fit, color="C3", label="Recent HI Points", zorder=3)
+    ax.plot(t, pred_hi, color="C0", alpha=0.3, label="Raw Pred HI")
+    ax.plot(t, hi_kf, color="C1", lw=2, label="KF Filtered HI")
     ax.axhline(HI_FAILURE_THRESHOLD, color="r", linestyle="--", label="Failure Threshold")
-    
-    try:
-        popt, _ = curve_fit(_exp_model, t_norm, h_fit, p0=[0.05, 1e-3, 0.0], bounds=bounds, method="trf", maxfev=20000)
-        a, b, c = popt
-        # Generate extended curve
-        t_ext_norm = np.linspace(t_fit[0]/t_scale, max(t_fit[-1]/t_scale, 2.0), 100)
-        h_ext = _exp_model(t_ext_norm, a, b, c)
-        
-        t_ext = t_ext_norm * t_scale
-        ax.plot(t_ext, h_ext, color="C2", lw=2, label="Fitted Exponential")
-        
-        # Predicted failure point
-        inner = (HI_FAILURE_THRESHOLD - c) / a
-        if inner > 0 and b > 0:
-            t_fail = (np.log(inner) / b) * t_scale
-            ax.scatter([t_fail], [HI_FAILURE_THRESHOLD], color="r", marker="*", s=200, label=f"Pred Failure (t={t_fail:.0f})")
-            ax.set_xlim(t_fit[0] * 0.9, max(t_fail * 1.1, t_now * 1.5))
-    except Exception:
-        ax.set_title("Curve Fit Failed")
-        
-    ax.set_ylim(-0.1, 1.2)
+    ax.axhline(_FDP_THRESHOLD, color="gray", linestyle=":", label="FDP Threshold")
+    t_now = float(t[-1])
+
+    if hi_kf[-1] > _FDP_THRESHOLD:
+        from stage2 import _WLS_RECENCY_DECAY
+        n = len(t)
+        rolling = min(300, n)
+            
+        t_window = t[-rolling:]
+        hi_window = hi_raw_kf[-rolling:]
+        hi_window = np.maximum.accumulate(hi_window)
+        t_offset = t_window[0]
+        t_norm = t_window - t_offset
+        w = np.exp(_WLS_RECENCY_DECAY * np.arange(rolling, dtype=np.float64) / max(rolling - 1, 1))
+
+        try:
+            epsilon = 1e-6
+            y_log = np.log(np.clip(hi_window, epsilon, None))
+            coeffs = np.polyfit(t_norm, y_log, 1, w=w)
+            b1, b0 = coeffs[0], coeffs[1]
+            
+            if b1 > 1e-8:
+                y_target = np.log(HI_FAILURE_THRESHOLD)
+                t_fail_norm = (y_target - b0) / b1
+                t_fail = t_fail_norm + t_offset
+                
+                t_ext = np.linspace(t_offset, max(t_fail * 1.05, t_now * 1.2), 120)
+                hi_ext = np.exp(b1 * (t_ext - t_offset) + b0)
+                ax.plot(t_ext, hi_ext, color="C3", lw=2, label="Log-Linear Extrapolation")
+                
+                rul = max(t_fail - t_now, 0.0)
+                ax.scatter([t_fail], [HI_FAILURE_THRESHOLD], color="r", marker="*",
+                           s=200, zorder=5,
+                           label=f"Pred Failure (t={t_fail:.0f}, RUL={rul:.0f})")
+                ax.set_xlim(float(t[0]) * 0.9, max(t_fail * 1.1, t_now * 1.2))
+        except:
+            pass
+    else:
+        ax.text(0.05, 0.92, "FDP not triggered (steady stage)",
+                transform=ax.transAxes, color="gray", fontsize=10)
+
+    ax.set_ylim(-0.05, 1.15)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("HI")
-    ax.set_title(f"[{case_label}] Stage-2 Fitting (Epoch {epoch_label})")
-    ax.legend()
+    ax.set_title(f"[{case_label}] Stage-2 Exp Fit (Epoch {epoch_label})")
+    ax.legend(loc="upper left", fontsize=9)
     fig.tight_layout()
     plt.savefig(epoch_dir / "stage2_fit.png", dpi=120)
     plt.close(fig)
@@ -155,19 +168,6 @@ def _make_trajectory_plot(
     plt.savefig(epoch_dir / "rul_traj.png", dpi=120)
     plt.close(fig)
 
-
-def _standardize(train_array: np.ndarray, val_array: np.ndarray):
-    feature_shape = train_array.shape[2:]
-    flat = train_array.reshape(-1, *feature_shape)
-    mean = flat.mean(axis=0)
-    std = flat.std(axis=0)
-    std = np.where(std < 1e-8, 1.0, std)
-    return (
-        ((train_array - mean) / std).astype(np.float32),
-        ((val_array - mean) / std).astype(np.float32),
-        torch.tensor(mean, dtype=torch.float32),
-        torch.tensor(std, dtype=torch.float32),
-    )
 
 def _tensor(arr: np.ndarray) -> torch.Tensor:
     return torch.tensor(np.ascontiguousarray(arr), dtype=torch.float32)
@@ -244,8 +244,10 @@ def train(
         train_idx = np.where(train_mask)[0]
         print(f"\n========== Fold {fold}/{len(held_out_cases)} (held-out: {held_out}) ==========")
 
-        Xv_tr, Xv_va, vib_mean, vib_std = _standardize(X_vib[train_idx], X_vib[val_idx])
-        Xf_tr, Xf_va, feat_mean, feat_std = _standardize(X_feat[train_idx], X_feat[val_idx])
+        Xv_tr = X_vib[train_idx]
+        Xv_va = X_vib[val_idx]
+        Xf_tr = X_feat[train_idx]
+        Xf_va = X_feat[val_idx]
 
         hi_tr = hi[train_idx].astype(np.float32)
         hi_va = hi[val_idx].astype(np.float32)
@@ -483,10 +485,6 @@ def train(
                 "vibration_channels": X_vib.shape[2],
                 "vibration_features": X_vib.shape[3],
                 "handcrafted_dim": X_feat.shape[-1],
-                "vibration_mean": vib_mean,
-                "vibration_std": vib_std,
-                "feature_mean": feat_mean,
-                "feature_std": feat_std,
                 "degradation_baseline": baseline,
                 "best_score": best_val_score,
                 "best_epoch": best_epoch,

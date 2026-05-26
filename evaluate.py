@@ -24,18 +24,16 @@ from model import create_model
 from train import MODEL_PATH
 
 
-def _standardize(arr: np.ndarray, mean, std) -> np.ndarray:
-    m = np.array(mean.cpu().tolist()) if isinstance(mean, torch.Tensor) else np.asarray(mean)
-    s = np.array(std.cpu().tolist()) if isinstance(std, torch.Tensor) else np.asarray(std)
-    s = np.where(s < 1e-8, 1.0, s)
-    return ((arr - m) / s).astype(np.float32)
+
 
 
 def _discover_fold_checkpoints(model_path: Path) -> list[Path]:
     model_path = Path(model_path)
     pattern_seed = f"{model_path.stem}_seed*_fold*.pt"
     pattern_plain = f"{model_path.stem}_fold*.pt"
+    import re
     folds = sorted(set(model_path.parent.glob(pattern_seed)) | set(model_path.parent.glob(pattern_plain)))
+    folds = [f for f in folds if re.search(r"_fold\d+\.pt$", f.name)]
     if folds:
         return folds
     if model_path.exists():
@@ -50,7 +48,7 @@ def _load_fold(ckpt_path: Path, device: torch.device):
         vibration_features=ckpt["vibration_features"],
         handcrafted_dim=ckpt["handcrafted_dim"],
     ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.eval()
     return model, ckpt
 
@@ -114,11 +112,12 @@ def evaluate_test(
     )
 
     device = torch.device(DEVICE)
+    X_vib = X_vib_raw
+    X_feat = X_feat_raw
+
     fold_hi: list[np.ndarray] = []
     for fp in fold_paths:
-        model, ckpt = _load_fold(fp, device)
-        X_vib = _standardize(X_vib_raw, ckpt["vibration_mean"], ckpt["vibration_std"])
-        X_feat = _standardize(X_feat_raw, ckpt["feature_mean"], ckpt["feature_std"])
+        model, _ckpt = _load_fold(fp, device)
         hi = _predict(model, X_vib, X_feat, device, elapsed_frac=elapsed_frac)
         print(f"  {fp.name}: HI mean={hi.mean():.3f}")
         fold_hi.append(hi)

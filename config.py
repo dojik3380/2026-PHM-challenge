@@ -68,8 +68,8 @@ HANDCRAFTED_FEATURES = (
 )
 HANDCRAFTED_DIM = len(HANDCRAFTED_FEATURES)
 DEGRADATION_BASELINE_TIMESTEPS = 10                # first N timesteps used as healthy baseline
-HI_FEATURES_ENABLED = True                          # 10-dim -> 30-dim: [rel, cummax_rel, damage_rel]
-AUGMENTED_HANDCRAFTED_DIM = (HANDCRAFTED_DIM * 3 + 1) if HI_FEATURES_ENABLED else HANDCRAFTED_DIM
+HI_FEATURES_ENABLED = True                          # 19-dim -> 57-dim: [rel, cummax_rel, damage_rel]
+AUGMENTED_HANDCRAFTED_DIM = (HANDCRAFTED_DIM * 3) if HI_FEATURES_ENABLED else HANDCRAFTED_DIM
 
 
 # HI label generation ---------------------------------------------------------
@@ -81,7 +81,7 @@ AUGMENTED_HANDCRAFTED_DIM = (HANDCRAFTED_DIM * 3 + 1) if HI_FEATURES_ENABLED els
 #              short/long-lifetime outlier problem (Train3 / Train4) that
 #              time-based labels suffer from.
 #   "hybrid" : 0.5 * linear + 0.5 * damage                (best of both)
-HI_LABEL_MODE = "exponential"
+HI_LABEL_MODE = "hybrid"
 HI_ALPHA = 4.0               # degradation acceleration: HI(t) = (e^(α·t/T)-1)/(e^α-1)
 HI_LABEL_POWER = 2.0
 HI_DAMAGE_SCALE = 5.0        # RMS growth ratio that maps to HI=1.0 (tanh saturation)
@@ -123,7 +123,7 @@ TDMS_CHUNKS_PER_FILE = 6                             # 60 s TDMS file -> 6 chunk
 # windows enough to avoid trivial memorization and is 4x faster to train.
 WINDOW_SIZE = 32
 STRIDE = 4
-EPOCHS = 35
+EPOCHS = 40
 BATCH_SIZE = 32
 LEARNING_RATE = 2e-4
 DROPOUT = 0.5
@@ -160,6 +160,34 @@ DENORM_SCALE = 1.0
 # Post-hoc conservative calibration at inference (multiply final RUL by this).
 # 1.0 = neutral. Tune on OOF: sweep [0.6, 1.0] and pick α that maximises A_RUL.
 CALIBRATION_SHRINK = 1.0
+
+
+# Stage 2 (RUL Estimation) ----------------------------------------------------
+STAGE2_FALLBACK_RUL_CAP   = 200_000.0   # 최후 fallback (변화점 못 찾고 신호 없을 때)
+STAGE2_RUL_BEFORE_FDP     = 30_000.0    # FCP 발견 전 기본 RUL (steady stage)
+STAGE2_FCP_MIN_HISTORY    = 20          # AIC 가동 최소 점 수
+STAGE2_FCP_MIN_SEGMENT    = 15          # 각 stage 최소 점 수 (false-positive FCP 억제)
+STAGE2_AIC_C_ALPHA        = 8.0        # 임계 ↑ : noise 데이터에서 false-positive FCP 억제
+
+STAGE2_KF_Q               = 1e-4        # process noise variance (K_ss≈0.31). 5e-5 까지 줄였더니 over-smooth.
+STAGE2_KF_R               = 5e-4        # measurement noise variance
+STAGE2_KF_P0              = 1.0         # 초기 covariance
+STAGE2_KF_OUTLIER_LO      = 0.10        # raw HI < 이 값으로 dip 하면 측정 update skip
+STAGE2_KF_OUTLIER_STATE   = 0.20        # state > 이 값일 때만 outlier 판정 (초기 단계 정상 0 보호)
+
+STAGE2_HI_LOG_EPS         = 1e-2        # log 변환 안정성. D ≈ 4.605.
+STAGE2_RUL_QUANTILE_K     = 0.5         # 보수 quantile (0.5 ≈ 30% lower bound, k=1.0은 너무 공격적)
+STAGE2_RUL_MAX_CV         = 1.0         # σ_RUL / l_mean 가 이보다 크면 신뢰 부족 → reject
+STAGE2_BETA_MIN_FACTOR    = 1.0         # β > _BETA_MIN_FACTOR / lifetime 이상이어야 의미있는 drift
+
+STAGE2_WLS_RECENCY_DECAY  = 5.0
+STAGE2_WLS_ROLLING_WINDOW = 50           # FCP 이후 최근 N 점만 사용 (30 은 짧음, β 추정 noisy)
+STAGE2_FDP_THRESHOLD      = 0.15         # KF_Filtered_HI > 0.15 일 때만 curve_fit 발동
+
+STAGE2_FCP_MIN_RATIO      = 0.10         # increment 인덱스 비율로 너무 이른 FCP 거부
+STAGE2_FCP_MAX_RATIO      = 0.95         # 너무 늦은 FCP 도 거부 (외삽 데이터 부족)
+
+STAGE2_ROLLING_WINDOW     = 30          # legacy: train.py plot 호환
 
 
 # Runtime ---------------------------------------------------------------------

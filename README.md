@@ -309,3 +309,10 @@ DO NOT:
 
 ---
 
+# 12. CRITICAL AGENT INSTRUCTIONS
+
+> [!WARNING]
+> **DO NOT DELETE OR CLEAR THE `data2_features` STFT CACHE WITHOUT EXPLICIT USER PERMISSION!**
+> 
+> The STFT and handcrafted feature extraction process (including dynamic FFT-based RPM estimation) is extremely computationally expensive. The cache perfectly handles dynamic 1X Shaft estimation. 
+> Even if you modify the name of a feature extraction function, do NOT clear the cache unless the underlying mathematical logic fundamentally changes. **ALWAYS reuse the cache** by default or explicitly ask the USER before triggering a rebuild.
