@@ -30,6 +30,8 @@ from config import (
     HI_RANK_LOSS_WEIGHT,
     HUBER_DELTA,
     OVER_EST_PENALTY_SCALE,
+    STAGE_CE_WEIGHT,
+    STAGE_NUM_CLASSES,
     UNDER_EST_PENALTY_SCALE,
     VIB_HIDDEN,
     VIBRATION_FEATURES_PER_CHANNEL,
@@ -111,7 +113,7 @@ class HIPairwiseRankingLoss(nn.Module):
 
 
 class TrainingLoss(nn.Module):
-    """L = hi_weight * Huber + hi_rank_weight * Rank + λ1 * Mono + λ2 * Smooth"""
+    """L = hi*Huber + rank*Rank + λ1*Mono + λ2*Smooth + stage*CE(Stage)"""
 
     def __init__(
         self,
@@ -119,14 +121,17 @@ class TrainingLoss(nn.Module):
         hi_rank_weight: float = HI_RANK_LOSS_WEIGHT,
         lambda1:        float = 0.5,
         lambda2:        float = 0.1,
+        stage_weight:   float = STAGE_CE_WEIGHT,
     ):
         super().__init__()
         self.hi_loss      = nn.HuberLoss(delta=HUBER_DELTA, reduction="none")
         self.hi_ranking   = HIPairwiseRankingLoss()
+        self.stage_ce     = nn.CrossEntropyLoss()
         self.hi_weight      = hi_weight
         self.hi_rank_weight = hi_rank_weight
         self.lambda1        = lambda1
         self.lambda2        = lambda2
+        self.stage_weight   = stage_weight
 
     def forward(
         self,
@@ -135,7 +140,9 @@ class TrainingLoss(nn.Module):
         case_ids:     Optional[torch.Tensor] = None,
         elapsed:      Optional[torch.Tensor] = None,
         late_weights: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        stage_logits: Optional[torch.Tensor] = None,
+        stage_labels: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         p_hi = pred_hi.view(-1)
         t_hi = target_hi.view(-1)
 
@@ -154,29 +161,36 @@ class TrainingLoss(nn.Module):
         if case_ids is not None and elapsed is not None:
             c_ids = case_ids.view(-1)
             elap = elapsed.view(-1)
-            
+
             sort_keys = c_ids.float() * 1000.0 + elap
             sort_idx = torch.argsort(sort_keys)
-            
+
             p_sorted = p_hi[sort_idx]
             c_sorted = c_ids[sort_idx]
-            
+
             same_case_mask = (c_sorted[:-1] == c_sorted[1:])
-            
+
             if same_case_mask.any():
                 p_prev = p_sorted[:-1][same_case_mask]
                 p_next = p_sorted[1:][same_case_mask]
-                
+
                 l_mono = torch.relu(p_prev - p_next).mean()
                 l_smooth = torch.abs(p_next - p_prev).mean()
 
+        # Stage classification CE — case fingerprint / absolute lifetime position
+        if stage_logits is not None and stage_labels is not None:
+            l_stage = self.stage_ce(stage_logits, stage_labels.view(-1).long())
+        else:
+            l_stage = torch.tensor(0.0, device=pred_hi.device)
+
         total = (
-            self.hi_weight * l_hi 
-            + self.hi_rank_weight * l_hi_rank 
-            + self.lambda1 * l_mono 
+            self.hi_weight * l_hi
+            + self.hi_rank_weight * l_hi_rank
+            + self.lambda1 * l_mono
             + self.lambda2 * l_smooth
+            + self.stage_weight * l_stage
         )
-        return total, l_hi, l_hi_rank, l_mono, l_smooth
+        return total, l_hi, l_hi_rank, l_mono, l_smooth, l_stage
 
 
 def asymmetric_rul_score_np(predictions, targets) -> np.ndarray:
@@ -270,10 +284,19 @@ class HIModel(nn.Module):
             nn.Linear(96, 1),
             nn.Sigmoid(),
         )
+        # Stage classification auxiliary head: lifetime quantile 4-class
+        # (healthy / incipient / fault / severe) → case fingerprint representation
+        # 학계 표준 multi-task: contrastive 대안. 절대 lifetime 위치 학습.
+        self.stage_head = nn.Linear(96, STAGE_NUM_CLASSES)
 
     def forward(self, x_vib: torch.Tensor, x_feat: torch.Tensor,
-                elapsed_frac: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Return hi_pred ∈ [0, 1].  elapsed_frac = time_sec / case_max ∈ [0, 1]."""
+                elapsed_frac: Optional[torch.Tensor] = None,
+                return_stage: bool = False):
+        """Return hi_pred ∈ [0, 1]. return_stage=True 면 (hi, stage_logits) tuple.
+
+        elapsed_frac = time_sec / case_max ∈ [0, 1].
+        backward compat: 기본 return_stage=False → 기존 호출자 (HI 만) 그대로.
+        """
         b, seq, ch, fbin = x_vib.shape
 
         v = x_vib.reshape(b * seq, ch, fbin)
@@ -295,7 +318,11 @@ class HIModel(nn.Module):
         h_elapsed = self.elapsed_embed(elapsed_frac.view(b, 1))
 
         h = self.fusion(torch.cat([h_vib, h_feat, h_elapsed], dim=1))
-        return self.hi_head(h)
+        hi = self.hi_head(h)
+        if return_stage:
+            stage_logits = self.stage_head(h)
+            return hi, stage_logits
+        return hi
 
 
 # ── backward-compat alias (evaluate.py / train.py에서 create_model() 사용) ──

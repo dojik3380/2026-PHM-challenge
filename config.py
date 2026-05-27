@@ -81,7 +81,7 @@ AUGMENTED_HANDCRAFTED_DIM = (HANDCRAFTED_DIM * 3) if HI_FEATURES_ENABLED else HA
 #              short/long-lifetime outlier problem (Train3 / Train4) that
 #              time-based labels suffer from.
 #   "hybrid" : 0.5 * linear + 0.5 * damage                (best of both)
-HI_LABEL_MODE = "hybrid"
+HI_LABEL_MODE = "exponential"
 HI_ALPHA = 4.0               # degradation acceleration: HI(t) = (e^(α·t/T)-1)/(e^α-1)
 HI_LABEL_POWER = 2.0
 HI_DAMAGE_SCALE = 5.0        # RMS growth ratio that maps to HI=1.0 (tanh saturation)
@@ -113,6 +113,12 @@ VIBRATION_FEATURES_PER_CHANNEL = STFT_FREQ_BINS * 2  # mean + std (513 x 2 = 102
 TDMS_CHUNK_SAMPLES = 256_000
 TDMS_CHUNK_SECONDS = 10.0
 TDMS_CHUNKS_PER_FILE = 6                             # 60 s TDMS file -> 6 chunks
+
+# TDMS 측정 cycle: 1분 측정 + 9분 휴식 = 10분 wall-clock cycle.
+# 한 TDMS file = 1분 측정 = 6 chunks (10s 단위). 이후 9분간 측정 없음.
+# wall-clock(chunk i) = (i // 6) × TDMS_CYCLE_SECONDS + (i % 6) × TDMS_CHUNK_SECONDS
+# 등간격 linspace 로 잡으면 file 내 6 chunks 의 t 가 약 10배 펴져 HI/stage 라벨이 부정확해짐.
+TDMS_CYCLE_SECONDS = 600.0                            # 10분 cycle
 
 
 # Training --------------------------------------------------------------------
@@ -182,12 +188,45 @@ STAGE2_BETA_MIN_FACTOR    = 1.0         # β > _BETA_MIN_FACTOR / lifetime 이�
 
 STAGE2_WLS_RECENCY_DECAY  = 5.0
 STAGE2_WLS_ROLLING_WINDOW = 50           # FCP 이후 최근 N 점만 사용 (30 은 짧음, β 추정 noisy)
-STAGE2_FDP_THRESHOLD      = 0.15         # KF_Filtered_HI > 0.15 일 때만 curve_fit 발동
+
+# FDP threshold: 정적 0.15 → **동적 (baseline noise 기반)** (학계 표준 3σ rule)
+# 각 case 의 첫 N window 의 HI_kf mean+std 로 진입 임계 결정.
+# Nguyen et al. 2025, Wang & Xiang 2021 등 사용. fold 별 HI 분포 변동에 강건.
+STAGE2_FDP_BASELINE_N = 30               # 첫 N window 로 baseline 통계 계산
+STAGE2_FDP_K_SIGMA    = 3.0              # mean + k·σ
+STAGE2_FDP_MIN        = 0.08             # 최소 임계 (지나치게 낮은 noise spike 차단)
+STAGE2_FDP_MAX        = 0.30             # 최대 임계 (FDP 너무 늦어지면 lifetime 대부분 fallback)
+STAGE2_FDP_THRESHOLD  = 0.15             # legacy static fallback (lifetime_prior 없을 때만)
 
 STAGE2_FCP_MIN_RATIO      = 0.10         # increment 인덱스 비율로 너무 이른 FCP 거부
 STAGE2_FCP_MAX_RATIO      = 0.95         # 너무 늦은 FCP 도 거부 (외삽 데이터 부족)
 
 STAGE2_ROLLING_WINDOW     = 30          # legacy: train.py plot 호환
+
+# Stage 2 — log-linear curve fit (사용자 수정 stage2.py 의 magic number 들)
+STAGE2_MACRO_ROLLING      = 300          # macro fitting 광역 윈도우 (50분, 노이즈 스파이크 저항)
+STAGE2_LOG_EPS            = 1e-6         # log(HI) 안정화용 epsilon
+STAGE2_BETA_MIN_FIT       = 1e-8         # log-linear slope 이 이보다 작으면 reject
+STAGE2_FDP_FALLBACK_RUL   = 200_000.0     # FDP 미도달 시 global linear fit 의 safe upper bound (Long-life outlier 대응)
+STAGE2_FDP_MIN_SLOPE      = 1e-8         # FDP 미도달 global fit 의 slope 임계
+
+# Stage 1 — per-case local normalization (Train4 OOD 해소)
+STAGE1_NORMALIZE_N_BASELINE = DEGRADATION_BASELINE_TIMESTEPS  # 첫 N window 가 healthy
+
+# Stage 2 — Lifetime prior (training fold lifetime distribution)
+# Track 1 fallback 의 60000s hardcoded 를 *학습 fold lifetime 의 lognormal MRL* 로 교체.
+# 학계 표준 (Si et al. 2011 review). LOCO 각 fold 의 train cases lifetime fit → prior.
+# inference 시 conditional MRL(t_now) = E[T-t|T>t] 사용.
+STAGE2_LIFETIME_PRIOR_DIST = "lognormal"   # 분포 family
+STAGE2_LIFETIME_PRIOR_QUANTILE = 0.35      # 보수적인 분위수(35%) 적용 (Risk-averse)
+STAGE2_FALLBACK_FLOOR      = 2_000.0       # CQRL fallback 의 최소값 (degenerate prior 방지)
+
+# Stage 1 — Degradation Stage Classification (auxiliary multi-task head)
+# absolute lifetime position 학습 → case fingerprint representation
+# 4-class CE: lifetime fraction 을 경계로 양자화
+STAGE_CE_WEIGHT     = 0.3                           # loss 비중 (HI Huber + Rank 와 함께)
+STAGE_BOUNDARIES    = (0.40, 0.70, 0.90)            # healthy/incipient/fault/severe (quantile, late-loaded)
+STAGE_NUM_CLASSES   = len(STAGE_BOUNDARIES) + 1     # = 4
 
 
 # Runtime ---------------------------------------------------------------------

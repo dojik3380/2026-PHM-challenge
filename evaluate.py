@@ -116,11 +116,26 @@ def evaluate_test(
     X_feat = X_feat_raw
 
     fold_hi: list[np.ndarray] = []
+    lifetime_priors: list[dict] = []   # fold 별 lognormal prior — Stage 2 MRL fallback 용
     for fp in fold_paths:
         model, _ckpt = _load_fold(fp, device)
         hi = _predict(model, X_vib, X_feat, device, elapsed_frac=elapsed_frac)
         print(f"  {fp.name}: HI mean={hi.mean():.3f}")
         fold_hi.append(hi)
+        lp = _ckpt.get("lifetime_prior")
+        if lp is not None:
+            lifetime_priors.append(lp)
+
+    # Ensemble lifetime prior: fold 들의 (μ, σ) 평균. 모든 fold 가 None 이면 None.
+    if lifetime_priors:
+        ens_mu    = float(np.mean([lp["mu"]    for lp in lifetime_priors]))
+        ens_sigma = float(np.mean([lp["sigma"] for lp in lifetime_priors]))
+        lifetime_prior_ens = {"mu": ens_mu, "sigma": ens_sigma}
+        print(f"[ensemble] lifetime prior: μ={ens_mu:.2f}  σ={ens_sigma:.3f}  "
+              f"median={np.exp(ens_mu):.0f}s  mean={np.exp(ens_mu + ens_sigma**2/2):.0f}s")
+    else:
+        lifetime_prior_ens = None
+        print("[ensemble] no lifetime prior in checkpoints — legacy fallback")
 
     hi_ens = np.mean(np.stack(fold_hi, axis=0), axis=0)
     print(f"\n[ensemble] HI mean={hi_ens.mean():.3f}")
@@ -137,7 +152,8 @@ def evaluate_test(
         case_times      = metadata.iloc[sorted_idx]["time_sec"].to_numpy(np.float64)
         case_hi         = hi_ens[sorted_idx]
 
-        rul_s2 = fit_stage2_rul(case_times, case_hi, failure_threshold=HI_FAILURE_THRESHOLD)
+        rul_s2 = fit_stage2_rul(case_times, case_hi, failure_threshold=HI_FAILURE_THRESHOLD,
+                                 lifetime_prior=lifetime_prior_ens)
         rul_s2 = float(max(rul_s2 * CALIBRATION_SHRINK, 0.0))
 
         last_global = sorted_idx[-1]

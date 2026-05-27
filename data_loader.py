@@ -46,9 +46,33 @@ from config import (
     TDMS_CHUNK_SAMPLES,
     TDMS_CHUNK_SECONDS,
     TDMS_CHUNKS_PER_FILE,
+    TDMS_CYCLE_SECONDS,
     TRAIN_DIR,
     VIBRATION_FEATURES_PER_CHANNEL,
 )
+
+
+def _tdms_wallclock_times(n_steps: int) -> np.ndarray:
+    """**Training TDMS** chunk i 의 wall-clock 시간 (초).
+
+    Train/Val (data/Train): 1분 측정 + 9분 휴식 = 10분 cycle. file = 6 chunks (10s).
+        wall_clock(i) = (i // 6) × CYCLE + (i % 6) × CHUNK_SECONDS
+    Test 데이터는 *연속 측정* 이므로 _continuous_times() 를 사용 (이 함수 NO).
+    """
+    file_idx  = np.arange(n_steps, dtype=np.int64) // TDMS_CHUNKS_PER_FILE
+    chunk_idx = np.arange(n_steps, dtype=np.int64) %  TDMS_CHUNKS_PER_FILE
+    return (file_idx * TDMS_CYCLE_SECONDS + chunk_idx * TDMS_CHUNK_SECONDS).astype(np.float32)
+
+
+def _continuous_times(n_steps: int) -> np.ndarray:
+    """**Test / Validation** chunk i 의 wall-clock 시간 (초).
+
+    대회 명세: Test/Validation 은 *시간적으로 연속된* 데이터 (휴식 없음).
+        t(i) = i × CHUNK_SECONDS
+    Training cycle 가정을 그대로 적용하면 lifetime 을 ~10배 over-estimate 하여
+    Stage 2 RUL 외삽이 부정확해짐.
+    """
+    return (np.arange(n_steps, dtype=np.int64) * TDMS_CHUNK_SECONDS).astype(np.float32)
 from features.degradation import augment_with_degradation, compute_global_baseline
 from features.vibration import bearing_fault_amplitudes, shaft_harmonic_amplitudes, stft_magnitude_vector
 
@@ -469,7 +493,13 @@ def load_original_case_timesteps(
     key = _cache_key([operation_csv, *tdms_files], f"orig:{case_name}:{CACHE_VERSION}")
     cache_path = DATA2_FEATURE_CACHE_DIR / f"original_{case_name}_{key}.npz"
     if use_cache and cache_path.exists():
-        return _load_case_cache(cache_path)
+        vib, feat, _old_times, case_max, meta = _load_case_cache(cache_path)
+        # times 만 wall-clock 으로 overwrite (cache 의 등간격 times 는 무효).
+        # STFT/feat 는 그대로 — cache 정책상 그것만 바뀔 때 CACHE_VERSION ↑.
+        times = _tdms_wallclock_times(len(_old_times))
+        meta = meta.copy()
+        meta["time_sec"] = times
+        return vib, feat, times, case_max, meta
 
     n_files = len(tdms_files)
     n_steps = n_files * TDMS_CHUNKS_PER_FILE
@@ -477,10 +507,10 @@ def load_original_case_timesteps(
         raise ValueError(f"No TDMS files in {vibration_dir}")
 
     case_max = float(op_df["time_sec"].max())
-    if n_steps > 1:
-        times = (case_max * np.arange(n_steps, dtype=np.float32) / float(n_steps - 1)).astype(np.float32)
-    else:
-        times = np.array([case_max], dtype=np.float32)
+    # Wall-clock times: TDMS 1분 측정 + 9분 휴식 cycle 반영
+    # (등간격 linspace 가정은 file 내 6 chunks 의 시간을 약 10배 펴서 HI/stage 라벨 부정확)
+    times = _tdms_wallclock_times(n_steps)
+    # 마지막 chunk wall-clock 보다 case_max (op CSV) 가 약간 큼 (휴식 일부 포함). 그대로 유지.
 
     vib_steps = np.zeros((n_steps, len(TDMS_CHANNELS), VIBRATION_FEATURES_PER_CHANNEL), dtype=np.float32)
     feat_steps = np.zeros((n_steps, len(TDMS_CHANNELS), HANDCRAFTED_DIM), dtype=np.float32)
@@ -610,7 +640,11 @@ def load_original_inference_case(
     key = _cache_key(tdms_files, f"orig_inf:{case_name}:{CACHE_VERSION}")
     cache_path = DATA2_FEATURE_CACHE_DIR / f"original_inference_{case_name}_{key}.npz"
     if use_cache and cache_path.exists():
-        vib, feat, times, _case_max, meta = _load_case_cache(cache_path)
+        vib, feat, _old_times, _case_max, meta = _load_case_cache(cache_path)
+        # Test 는 연속 측정 — 학습 cycle 가정과 다름. 매 load 시 재계산.
+        times = _continuous_times(len(_old_times))
+        meta = meta.copy()
+        meta["time_sec"] = times
         return vib, feat, times, meta
 
     n_files = len(tdms_files)
@@ -632,7 +666,8 @@ def load_original_inference_case(
                 vib_steps[gstep, ch_i] = stft_magnitude_vector(chunk)
                 feat_steps[gstep, ch_i] = handcrafted_features_from_signal(chunk)
 
-    times = np.arange(n_steps, dtype=np.float32) * TDMS_CHUNK_SECONDS
+    # Test/Validation 은 *연속 측정* (대회 명세). cycle 가정 적용 금지.
+    times = _continuous_times(n_steps)
     meta = pd.DataFrame({
         "case_name": case_name,
         "source": "original_inference",

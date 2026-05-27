@@ -34,6 +34,7 @@ from config import (
     RANDOM_VAL_CASE,
     RESULTS_DIR,
     SCHEDULER_T0,
+    STAGE_BOUNDARIES,
     STFT_FREQ_BINS,
     STFT_NOVERLAP,
     STFT_NPERSEG,
@@ -257,8 +258,33 @@ def train(
         elapsed_tr = metadata.iloc[train_idx]["time_sec"].to_numpy(np.float32) / case_max_tr
         elapsed_va = metadata.iloc[val_idx]["time_sec"].to_numpy(np.float32) / case_max_va
 
+        # Stage 2 lifetime prior — train fold cases 의 lognormal fit.
+        # Si et al. 2011 review 의 표준. LOCO 각 fold 별로 *학습 데이터만* 사용 → leak-free.
+        # Track 1 의 60000s static cap 을 conditional MRL 로 교체.
+        train_case_max = (
+            metadata.iloc[train_idx][["case_name", "case_max"]]
+            .drop_duplicates(subset="case_name")["case_max"]
+            .to_numpy(np.float64)
+        )
+        from scipy.stats import lognorm as _lognorm
+        try:
+            _shape, _loc, _scale = _lognorm.fit(train_case_max, floc=0)
+            lifetime_prior = {"mu": float(np.log(_scale)), "sigma": float(_shape)}
+            _med = float(_scale)
+            _mn  = float(np.exp(lifetime_prior["mu"] + lifetime_prior["sigma"] ** 2 / 2))
+            print(f"  Lifetime prior (lognormal): μ={lifetime_prior['mu']:.2f}  "
+                  f"σ={lifetime_prior['sigma']:.3f}  median={_med:.0f}s  mean={_mn:.0f}s "
+                  f"(N={len(train_case_max)} train cases)")
+        except Exception as _e:
+            print(f"  Lifetime prior fit failed: {_e} — fallback to legacy static cap")
+            lifetime_prior = None
+
         life_frac_tr = metadata.iloc[train_idx]["time_sec"].to_numpy(np.float32) / case_max_tr
+        life_frac_va = metadata.iloc[val_idx]["time_sec"].to_numpy(np.float32) / case_max_va
         late_weight_tr = np.where(life_frac_tr >= 0.8, LATE_LIFE_WEIGHT, 1.0).astype(np.float32)
+        # Stage classification labels: lifetime quantile → 0~3 class
+        stage_tr = np.digitize(life_frac_tr, STAGE_BOUNDARIES).astype(np.int64)
+        stage_va = np.digitize(life_frac_va, STAGE_BOUNDARIES).astype(np.int64)
 
         tr_case_names = metadata.iloc[train_idx]["case_name"].astype(str).to_numpy()
         unique_tr_cases = sorted(np.unique(tr_case_names).tolist())
@@ -274,6 +300,7 @@ def train(
             case_int_tr,
             _tensor(elapsed_tr).unsqueeze(1),
             _tensor(late_weight_tr).unsqueeze(1),
+            torch.tensor(stage_tr, dtype=torch.long),
         )
         if balanced:
             w = _balanced_weights(
@@ -289,7 +316,8 @@ def train(
             TensorDataset(_tensor(Xv_va), _tensor(Xf_va),
                           _tensor(hi_va).unsqueeze(1),
                           case_int_va,
-                          _tensor(elapsed_va).unsqueeze(1)),
+                          _tensor(elapsed_va).unsqueeze(1),
+                          torch.tensor(stage_va, dtype=torch.long)),
             batch_size=batch_size, shuffle=False,
         )
 
@@ -321,58 +349,69 @@ def train(
 
         for epoch in range(1, epochs + 1):
             model.train()
-            tr_hi = tr_hi_rank = tr_mono = tr_smooth = tr_tot = 0.0
-            for bv, bf, by_hi, by_case, by_elapsed, by_weight in train_loader:
+            tr_hi = tr_hi_rank = tr_mono = tr_smooth = tr_stage = tr_tot = 0.0
+            for bv, bf, by_hi, by_case, by_elapsed, by_weight, by_stage in train_loader:
                 bv, bf = bv.to(device), bf.to(device)
                 by_hi = by_hi.to(device)
                 by_case = by_case.to(device)
                 by_elapsed = by_elapsed.to(device)
                 by_weight = by_weight.to(device)
-                
+                by_stage = by_stage.to(device)
+
                 optimizer.zero_grad()
-                pred_hi = model(bv, bf, by_elapsed)
-                loss, l_hi, l_hi_rank, l_mono, l_smooth = criterion(pred_hi, by_hi, by_case, by_elapsed, by_weight)
-                
+                pred_hi, stage_logits = model(bv, bf, by_elapsed, return_stage=True)
+                loss, l_hi, l_hi_rank, l_mono, l_smooth, l_stage = criterion(
+                    pred_hi, by_hi, by_case, by_elapsed, by_weight,
+                    stage_logits=stage_logits, stage_labels=by_stage,
+                )
+
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-                
+
                 n = by_hi.size(0)
                 tr_hi      += l_hi.item()      * n
                 tr_hi_rank += l_hi_rank.item() * n
                 tr_mono    += l_mono.item()    * n
                 tr_smooth  += l_smooth.item()  * n
+                tr_stage   += l_stage.item()   * n
                 tr_tot     += loss.item()      * n
 
             model.eval()
-            va_hi = va_hi_rank = va_mono = va_smooth = va_tot = 0.0
+            va_hi = va_hi_rank = va_mono = va_smooth = va_stage = va_tot = 0.0
             _ep_hi = []
             with torch.no_grad():
-                for bv, bf, by_hi, by_case, by_elapsed in val_loader:
+                for bv, bf, by_hi, by_case, by_elapsed, by_stage in val_loader:
                     bv, bf = bv.to(device), bf.to(device)
                     by_hi = by_hi.to(device)
                     by_case = by_case.to(device)
                     by_elapsed = by_elapsed.to(device)
-                    
-                    pred_hi_b = model(bv, bf, by_elapsed)
-                    loss, l_hi, l_hi_rank, l_mono, l_smooth = criterion(pred_hi_b, by_hi, by_case, by_elapsed, None)
-                    
+                    by_stage = by_stage.to(device)
+
+                    pred_hi_b, stage_logits_b = model(bv, bf, by_elapsed, return_stage=True)
+                    loss, l_hi, l_hi_rank, l_mono, l_smooth, l_stage = criterion(
+                        pred_hi_b, by_hi, by_case, by_elapsed, None,
+                        stage_logits=stage_logits_b, stage_labels=by_stage,
+                    )
+
                     n = by_hi.size(0)
                     va_hi      += l_hi.item()      * n
                     va_hi_rank += l_hi_rank.item() * n
                     va_mono    += l_mono.item()    * n
                     va_smooth  += l_smooth.item()  * n
+                    va_stage   += l_stage.item()   * n
                     va_tot     += loss.item()      * n
                     _ep_hi.append(np.array(pred_hi_b.squeeze(1).cpu().tolist(), dtype=np.float32))
 
             n_tr, n_va = len(train_loader.dataset), len(val_loader.dataset)
-            tr_hi /= n_tr; tr_hi_rank /= n_tr; tr_mono /= n_tr; tr_smooth /= n_tr; tr_tot /= n_tr
-            va_hi /= n_va; va_hi_rank /= n_va; va_mono /= n_va; va_smooth /= n_va; va_tot /= n_va
+            tr_hi /= n_tr; tr_hi_rank /= n_tr; tr_mono /= n_tr; tr_smooth /= n_tr; tr_stage /= n_tr; tr_tot /= n_tr
+            va_hi /= n_va; va_hi_rank /= n_va; va_mono /= n_va; va_smooth /= n_va; va_stage /= n_va; va_tot /= n_va
             scheduler.step()
 
             ep_pred_hi  = np.concatenate(_ep_hi).astype(np.float64)
             
-            s2_rul = compute_stage2_trajectory(val_times_sec, ep_pred_hi, HI_FAILURE_THRESHOLD)
+            s2_rul = compute_stage2_trajectory(val_times_sec, ep_pred_hi, HI_FAILURE_THRESHOLD,
+                                                lifetime_prior=lifetime_prior)
             
             # --- STAGE-2 STABILITY MONITORING ---
             # 1. RUL Stability
@@ -441,7 +480,7 @@ def train(
         model.eval()
         hi_preds = []
         with torch.no_grad():
-            for bv, bf, _, _, be in val_loader:
+            for bv, bf, _, _, be, _ in val_loader:
                 ph = model(bv.to(device), bf.to(device), be.to(device))
                 hi_preds.append(np.array(ph.squeeze(1).cpu().tolist(), dtype=np.float32))
         hi_preds = np.concatenate(hi_preds).astype(np.float64)
@@ -490,6 +529,7 @@ def train(
                 "best_epoch": best_epoch,
                 "fold_summary": fold_summaries[-1],
                 "seed": seed,
+                "lifetime_prior": lifetime_prior,   # {"mu", "sigma"} or None — Stage 2 MRL fallback
             },
             fold_path,
         )

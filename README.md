@@ -117,7 +117,7 @@ temperature-related degradation signatures may exist indirectly inside vibration
 # 5. Dataset Overview
 
 Total cases:
-7 run-to-failure trajectories
+11 run-to-failure trajectories
 
 ## TDMS source
 
@@ -135,13 +135,21 @@ Total cases:
 | Train_No_1 | 60,360 s |
 | Train_No_2 | 96,720 s |
 | Train_No_3 | 68,400 s |
+| Train_No_4 | 145,320 s (Outlier - Long) |
+| Train_No_5 | 171,480 s (Outlier - Long) |
+| Train_No_6 | 32,280 s (Outlier - Short) |
+| Train_No_8 | 59,760 s |
 
 Overall:
-- minimum lifetime ≈ 53k s
-- maximum lifetime ≈ 97k s
-- spread ≈ 1.8×
+- minimum lifetime ≈ 32k s (8.9 h)
+- maximum lifetime ≈ 171k s (47.6 h)
+- spread ≈ 5.3×
 
-No extreme lifetime outlier exists.
+> [!NOTE]
+> **Extreme Lifetime Outliers & Data Diversity**
+> 수명 편차가 약 8.9시간에서 47.6시간(약 5.3배)에 달하는 극단적인 Outlier가 포함되어 있습니다. 
+> 이는 학술적 관점(Domain Generalization & Uncertainty)에서 모델의 Robustness를 검증하기 위한 **Data Diversity 확보 목적**으로 의도적으로 유지되었습니다. 
+> 관련 PHM 최신 연구들은 좁은 범위의 수명 데이터에만 특화된 End-to-End 예측은 실제 환경에서 Overfitting으로 실패함을 경고하며, Wiener process나 Kalman Filter 같은 **적응형 업데이트(Adaptive Updating)** 기법을 사용하여 큰 편차에 실시간으로 대응하는 것을 권장합니다. 본 파이프라인의 **Stage 1(진동 기반 손상 예측) + Stage 2(Kalman Filter 및 지수 외삽)** 구조는 이러한 극단적 수명 편차에도 강건하게(Robust) 적응하도록 설계되었습니다.
 
 ---
 

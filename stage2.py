@@ -21,7 +21,7 @@ import warnings
 warnings.filterwarnings("ignore", category=OptimizeWarning)
 
 from config import (
-    HI_FAILURE_THRESHOLD, 
+    HI_FAILURE_THRESHOLD,
     STAGE2_FALLBACK_RUL_CAP,
     STAGE2_RUL_BEFORE_FDP,
     STAGE2_KF_Q,
@@ -32,6 +32,12 @@ from config import (
     STAGE2_WLS_RECENCY_DECAY,
     STAGE2_WLS_ROLLING_WINDOW,
     STAGE2_FDP_THRESHOLD,
+    STAGE2_FDP_BASELINE_N,
+    STAGE2_FDP_K_SIGMA,
+    STAGE2_FDP_MIN,
+    STAGE2_FDP_MAX,
+    STAGE2_FALLBACK_FLOOR,
+    STAGE2_LIFETIME_PRIOR_QUANTILE,
 )
 
 # ---------------------------------------------------------------------------
@@ -87,6 +93,73 @@ def kalman_filter_hi(
             x_prev = x_pred + Kg * (obs - x_pred)
         out[k] = x_prev
     return out
+
+
+# ---------------------------------------------------------------------------
+# 1.5) Dynamic FDP threshold (3σ rule, 학계 표준)
+# ---------------------------------------------------------------------------
+def dynamic_fdp_threshold(
+    hi_kf: np.ndarray,
+    baseline_n: int = STAGE2_FDP_BASELINE_N,
+    k_sigma: float = STAGE2_FDP_K_SIGMA,
+    min_t: float = STAGE2_FDP_MIN,
+    max_t: float = STAGE2_FDP_MAX,
+) -> float:
+    """케이스 첫 N window 의 HI 통계로 동적 FDP 임계.
+
+    학계 표준 (3σ rule, Wang & Xiang 2021, Nguyen 2025): healthy baseline 의
+    noise level + k·std 위로 올라온 시점부터 degradation 진입. 정적 0.15 보다
+    fold 별 HI 모델 출력 분포 변동에 robust.
+    """
+    n = min(baseline_n, len(hi_kf))
+    if n < 5:
+        return float(min_t)
+    base = np.asarray(hi_kf[:n], dtype=np.float64)
+    thresh = float(np.mean(base) + k_sigma * np.std(base))
+    return float(np.clip(thresh, min_t, max_t))
+
+
+# ---------------------------------------------------------------------------
+# 1.6) Lognormal Conditional Quantile Residual Life (CQRL) (학계 보수적 Prior)
+# ---------------------------------------------------------------------------
+def lognormal_cqrl(t_now: float, mu: float, sigma: float, quantile: float = STAGE2_LIFETIME_PRIOR_QUANTILE) -> float:
+    """t_q - t_now | T > t_now for Lognormal(μ, σ).
+
+    Extreme Lifetime Outlier를 다루기 위해 평균(Mean) 대신 보수적인 분위수(Quantile)를 
+    사용하여 비대칭 패널티(Over-estimation) 위험을 회피(Risk-averse)합니다.
+
+    수식: F(t_q) = F(t_now) + q * (1 - F(t_now))
+          t_q = exp(μ + σ * Φ⁻¹(F(t_q)))
+          CQRL(t_now) = t_q - t_now
+    """
+    from scipy.stats import norm
+    t_now = max(float(t_now), 1.0)
+    log_t = np.log(t_now)
+    
+    # F(t_now) = P(T <= t_now)
+    f_t_now = norm.cdf((log_t - mu) / sigma)
+    
+    # Target CDF probability for the quantile condition
+    f_t_q = f_t_now + quantile * (1.0 - f_t_now)
+    
+    if f_t_q >= 1.0 - 1e-9:
+        return float(STAGE2_FALLBACK_FLOOR)
+        
+    # Inverse CDF (Percent Point Function) to find t_q
+    t_q = np.exp(mu + sigma * norm.ppf(f_t_q))
+    
+    cqrl = t_q - t_now
+    return float(max(cqrl, STAGE2_FALLBACK_FLOOR))
+
+
+def _fallback_rul(t_now: float, lifetime_prior: dict | None) -> float:
+    """Track 1 의 FDP 미통과 fallback. lifetime_prior 있으면 CQRL, 없으면 legacy 60000."""
+    if lifetime_prior is not None:
+        mu = float(lifetime_prior["mu"])
+        sigma = float(lifetime_prior["sigma"])
+        return lognormal_cqrl(t_now, mu, sigma, STAGE2_LIFETIME_PRIOR_QUANTILE)
+    # Legacy: static cap (인위적, 사용자 지적)
+    return 60_000.0
 
 
 # ---------------------------------------------------------------------------
@@ -158,8 +231,13 @@ def fit_stage2_rul(
     hi_preds: np.ndarray,
     failure_threshold: float = HI_FAILURE_THRESHOLD,
     fallback_rul_cap: float = _FALLBACK_RUL_CAP,
+    lifetime_prior: dict | None = None,
 ) -> float:
-    """현재까지의 HI 시퀀스 → 단일 RUL 점 추정. inference 진입점."""
+    """현재까지의 HI 시퀀스 → 단일 RUL 점 추정. inference 진입점.
+
+    lifetime_prior: {"mu": μ, "sigma": σ} of training fold lifetime lognormal fit.
+                    None 이면 legacy 60000s static cap 사용.
+    """
     times = np.asarray(times, dtype=np.float64)
     hi = np.asarray(hi_preds, dtype=np.float64)
     if len(times) == 0:
@@ -171,21 +249,33 @@ def fit_stage2_rul(
 
     hi_kf = kalman_filter_hi(h)
     hi_f = np.maximum.accumulate(hi_kf)
-    
+
     t_now = float(t[-1])
-    
-    if hi_f[-1] <= _FDP_THRESHOLD:
-        # Bayesian Linear Regression (Data-driven + Population Prior)
-        lam = 1e11
-        slope_prior = 0.5 / 72000.0
-        sum_t_hi = np.sum(t * hi_kf)
-        sum_t2 = np.sum(t**2)
-        
-        slope = (sum_t_hi + lam * slope_prior) / (sum_t2 + lam)
-        slope = max(slope, 1e-8)
-        t_max = 0.5 / slope
-        return float(max(t_max - t_now, 0.0))
-        
+    fdp_thresh = dynamic_fdp_threshold(hi_f)
+
+    if hi_f[-1] <= fdp_thresh:
+        # Track 1: FDP 미통과. Global Linear Fit + lifetime_prior MRL fallback
+        cap = _fallback_rul(t_now, lifetime_prior)
+        t_mean = np.mean(t)
+        hi_mean = np.mean(hi_kf)
+        t_centered = t - t_mean
+        hi_centered = hi_kf - hi_mean
+
+        sum_t2_centered = np.sum(t_centered ** 2)
+        if sum_t2_centered < 1e-6:
+            return cap
+
+        slope = np.sum(t_centered * hi_centered) / sum_t2_centered
+        if slope < 1e-8:
+            rul = cap
+        else:
+            intercept = hi_mean - slope * t_mean
+            t_fail = (HI_FAILURE_THRESHOLD - intercept) / slope
+            rul = max(t_fail - t_now, 0.0)
+            rul = min(rul, cap)   # lifetime-prior MRL 로 cap
+
+        return float(rul)
+
     rul = _fit_log_linear_rul(t, hi_kf, t_now, failure_threshold, fallback_rul_cap)
     return rul
 
@@ -195,10 +285,12 @@ def compute_stage2_trajectory(
     hi_preds: np.ndarray,
     failure_threshold: float = HI_FAILURE_THRESHOLD,
     fallback_rul_cap: float = _FALLBACK_RUL_CAP,
+    lifetime_prior: dict | None = None,
 ) -> np.ndarray:
-    """전체 시퀀스에 대해 online RUL trajectory 생성.
-    
-    각 timestep i 에서 [0..i] 데이터만 사용 → causal.
+    """전체 시퀀스 → online RUL trajectory.  각 timestep i 에서 [0..i] 만 사용 (causal).
+
+    lifetime_prior: dict(mu, sigma) of training-fold lognormal lifetime fit.
+                    None 이면 legacy 60000 static cap.
     """
     times = np.asarray(times, dtype=np.float64)
     hi = np.asarray(hi_preds, dtype=np.float64)
@@ -213,6 +305,9 @@ def compute_stage2_trajectory(
     hi_kf = kalman_filter_hi(h_s)
     hi_f = np.maximum.accumulate(hi_kf)
 
+    # Dynamic FDP threshold — case 의 첫 N window 통계로 결정 (한 번 계산, 모든 step 공통)
+    fdp_thresh = dynamic_fdp_threshold(hi_f)
+
     rul_s = np.full(N, fallback_rul_cap, dtype=np.float64)
     last_valid_rul = float(_RUL_BEFORE_FDP)
     last_valid_time = 0.0
@@ -220,35 +315,44 @@ def compute_stage2_trajectory(
     for i in range(N):
         t_now = float(t_s[i])
 
-        if hi_f[i] <= _FDP_THRESHOLD:
-            # Bayesian Linear Regression (Data-driven + Population Prior)
+        if hi_f[i] <= fdp_thresh:
+            # Track 1: linear fit + lifetime_prior MRL cap
+            cap = _fallback_rul(t_now, lifetime_prior)
             t_healthy = t_s[: i + 1]
             hi_healthy = hi_kf[: i + 1]
-            
-            lam = 1e11
-            slope_prior = 0.5 / 72000.0
-            sum_t_hi = np.sum(t_healthy * hi_healthy)
-            sum_t2 = np.sum(t_healthy**2)
-            
-            slope = (sum_t_hi + lam * slope_prior) / (sum_t2 + lam)
-            slope = max(slope, 1e-8)
-            t_max = 0.5 / slope
-            rul = max(t_max - t_now, 0.0)
-                
+
+            t_mean = np.mean(t_healthy)
+            hi_mean = np.mean(hi_healthy)
+            t_centered = t_healthy - t_mean
+            hi_centered = hi_healthy - hi_mean
+
+            sum_t2_centered = np.sum(t_centered ** 2)
+            if sum_t2_centered < 1e-6:
+                rul = cap
+            else:
+                slope = np.sum(t_centered * hi_centered) / sum_t2_centered
+                if slope < 1e-8:
+                    rul = cap
+                else:
+                    intercept = hi_mean - slope * t_mean
+                    t_fail = (HI_FAILURE_THRESHOLD - intercept) / slope
+                    rul = max(t_fail - t_now, 0.0)
+                    rul = min(rul, cap)
+
             rul_s[i] = rul
             last_valid_rul = rul
             last_valid_time = t_now
             continue
-            
+
         rul = _fit_log_linear_rul(t_s[: i + 1], hi_kf[: i + 1], t_now, failure_threshold, fallback_rul_cap)
-        
+
         dt = t_now - last_valid_time
         if last_valid_rul not in (_FALLBACK_RUL_CAP, _RUL_BEFORE_FDP):
             expected_rul = max(last_valid_rul - dt, 0.0)
             margin = max(expected_rul * 0.05, 50.0)
             if rul > expected_rul + margin:
                 rul = expected_rul
-                
+
         rul_s[i] = rul
         last_valid_rul = rul
         last_valid_time = t_now
