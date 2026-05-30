@@ -175,8 +175,8 @@ STAGE2_FCP_MIN_HISTORY    = 20          # AIC 가동 최소 점 수
 STAGE2_FCP_MIN_SEGMENT    = 15          # 각 stage 최소 점 수 (false-positive FCP 억제)
 STAGE2_AIC_C_ALPHA        = 8.0        # 임계 ↑ : noise 데이터에서 false-positive FCP 억제
 
-STAGE2_KF_Q               = 1e-4        # process noise variance (K_ss≈0.31). 5e-5 까지 줄였더니 over-smooth.
-STAGE2_KF_R               = 5e-4        # measurement noise variance
+STAGE2_KF_Q               = 0.00001     # Process noise covariance (Tuned: 0.0001 * 0.1)
+STAGE2_KF_R               = 0.1         # Measurement noise covariance (Tuned: 0.01 * 10.0)
 STAGE2_KF_P0              = 1.0         # 초기 covariance
 STAGE2_KF_OUTLIER_LO      = 0.10        # raw HI < 이 값으로 dip 하면 측정 update skip
 STAGE2_KF_OUTLIER_STATE   = 0.20        # state > 이 값일 때만 outlier 판정 (초기 단계 정상 0 보호)
@@ -192,10 +192,10 @@ STAGE2_WLS_ROLLING_WINDOW = 50           # FCP 이후 최근 N 점만 사용 (30
 # FDP threshold: 정적 0.15 → **동적 (baseline noise 기반)** (학계 표준 3σ rule)
 # 각 case 의 첫 N window 의 HI_kf mean+std 로 진입 임계 결정.
 # Nguyen et al. 2025, Wang & Xiang 2021 등 사용. fold 별 HI 분포 변동에 강건.
-STAGE2_FDP_BASELINE_N = 30               # 첫 N window 로 baseline 통계 계산
-STAGE2_FDP_K_SIGMA    = 3.0              # mean + k·σ
+STAGE2_FDP_BASELINE_N = 30               # 초기 Baseline 추정을 위한 윈도우 개수
+STAGE2_FDP_K_SIGMA    = 2.0              # Baseline 평균 대비 몇 시그마 위를 FDP로 볼 것인가 (Best tuned: 2.0)
 STAGE2_FDP_MIN        = 0.08             # 최소 임계 (지나치게 낮은 noise spike 차단)
-STAGE2_FDP_MAX        = 0.30             # 최대 임계 (FDP 너무 늦어지면 lifetime 대부분 fallback)
+STAGE2_FDP_MAX        = 0.25             # 최대 임계 (FDP 너무 늦어지면 lifetime 대부분 fallback)
 STAGE2_FDP_THRESHOLD  = 0.15             # legacy static fallback (lifetime_prior 없을 때만)
 
 STAGE2_FCP_MIN_RATIO      = 0.10         # increment 인덱스 비율로 너무 이른 FCP 거부
@@ -217,6 +217,8 @@ STAGE1_NORMALIZE_N_BASELINE = DEGRADATION_BASELINE_TIMESTEPS  # 첫 N window 가
 # Track 1 fallback 의 60000s hardcoded 를 *학습 fold lifetime 의 lognormal MRL* 로 교체.
 # 학계 표준 (Si et al. 2011 review). LOCO 각 fold 의 train cases lifetime fit → prior.
 # inference 시 conditional MRL(t_now) = E[T-t|T>t] 사용.
+# Track 1: 극한의 단수명 베어링 오차 방어를 위한 Lognormal 통계적 안전판 (CQRL)
+# - Train fold의 lifetime prior 분포 기반, 과대평가 방지를 위한 보수적 35% 분위수 사용 (Best tuned: 0.35)
 STAGE2_LIFETIME_PRIOR_DIST = "lognormal"   # 분포 family
 STAGE2_LIFETIME_PRIOR_QUANTILE = 0.35      # 보수적인 분위수(35%) 적용 (Risk-averse)
 STAGE2_FALLBACK_FLOOR      = 2_000.0       # CQRL fallback 의 최소값 (degenerate prior 방지)

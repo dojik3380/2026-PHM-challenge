@@ -152,12 +152,13 @@ def lognormal_cqrl(t_now: float, mu: float, sigma: float, quantile: float = STAG
     return float(max(cqrl, STAGE2_FALLBACK_FLOOR))
 
 
-def _fallback_rul(t_now: float, lifetime_prior: dict | None) -> float:
+def _fallback_rul(t_now: float, lifetime_prior: dict | None, cqrl_quantile: float | None = None) -> float:
     """Track 1 의 FDP 미통과 fallback. lifetime_prior 있으면 CQRL, 없으면 legacy 60000."""
+    q = cqrl_quantile if cqrl_quantile is not None else STAGE2_LIFETIME_PRIOR_QUANTILE
     if lifetime_prior is not None:
         mu = float(lifetime_prior["mu"])
         sigma = float(lifetime_prior["sigma"])
-        return lognormal_cqrl(t_now, mu, sigma, STAGE2_LIFETIME_PRIOR_QUANTILE)
+        return lognormal_cqrl(t_now, mu, sigma, q)
     # Legacy: static cap (인위적, 사용자 지적)
     return 60_000.0
 
@@ -232,6 +233,10 @@ def fit_stage2_rul(
     failure_threshold: float = HI_FAILURE_THRESHOLD,
     fallback_rul_cap: float = _FALLBACK_RUL_CAP,
     lifetime_prior: dict | None = None,
+    q_scale: float = 1.0,
+    r_scale: float = 1.0,
+    fdp_k_sigma: float | None = None,
+    cqrl_quantile: float | None = None,
 ) -> float:
     """현재까지의 HI 시퀀스 → 단일 RUL 점 추정. inference 진입점.
 
@@ -247,15 +252,15 @@ def fit_stage2_rul(
     t = times[order]
     h = np.clip(hi[order], 0.0, 1.0)
 
-    hi_kf = kalman_filter_hi(h)
+    hi_kf = kalman_filter_hi(h, Q=_KF_Q * q_scale, R=_KF_R * r_scale)
     hi_f = np.maximum.accumulate(hi_kf)
 
     t_now = float(t[-1])
-    fdp_thresh = dynamic_fdp_threshold(hi_f)
+    fdp_thresh = dynamic_fdp_threshold(hi_f, k_sigma=fdp_k_sigma if fdp_k_sigma is not None else STAGE2_FDP_K_SIGMA)
 
     if hi_f[-1] <= fdp_thresh:
         # Track 1: FDP 미통과. Global Linear Fit + lifetime_prior MRL fallback
-        cap = _fallback_rul(t_now, lifetime_prior)
+        cap = _fallback_rul(t_now, lifetime_prior, cqrl_quantile)
         t_mean = np.mean(t)
         hi_mean = np.mean(hi_kf)
         t_centered = t - t_mean
@@ -286,6 +291,10 @@ def compute_stage2_trajectory(
     failure_threshold: float = HI_FAILURE_THRESHOLD,
     fallback_rul_cap: float = _FALLBACK_RUL_CAP,
     lifetime_prior: dict | None = None,
+    q_scale: float = 1.0,
+    r_scale: float = 1.0,
+    fdp_k_sigma: float | None = None,
+    cqrl_quantile: float | None = None,
 ) -> np.ndarray:
     """전체 시퀀스 → online RUL trajectory.  각 timestep i 에서 [0..i] 만 사용 (causal).
 
@@ -302,11 +311,11 @@ def compute_stage2_trajectory(
     t_s = times[order]
     h_s = np.clip(hi[order], 0.0, 1.0)
 
-    hi_kf = kalman_filter_hi(h_s)
+    hi_kf = kalman_filter_hi(h_s, Q=_KF_Q * q_scale, R=_KF_R * r_scale)
     hi_f = np.maximum.accumulate(hi_kf)
 
     # Dynamic FDP threshold — case 의 첫 N window 통계로 결정 (한 번 계산, 모든 step 공통)
-    fdp_thresh = dynamic_fdp_threshold(hi_f)
+    fdp_thresh = dynamic_fdp_threshold(hi_f, k_sigma=fdp_k_sigma if fdp_k_sigma is not None else STAGE2_FDP_K_SIGMA)
 
     rul_s = np.full(N, fallback_rul_cap, dtype=np.float64)
     last_valid_rul = float(_RUL_BEFORE_FDP)
@@ -317,7 +326,7 @@ def compute_stage2_trajectory(
 
         if hi_f[i] <= fdp_thresh:
             # Track 1: linear fit + lifetime_prior MRL cap
-            cap = _fallback_rul(t_now, lifetime_prior)
+            cap = _fallback_rul(t_now, lifetime_prior, cqrl_quantile)
             t_healthy = t_s[: i + 1]
             hi_healthy = hi_kf[: i + 1]
 
