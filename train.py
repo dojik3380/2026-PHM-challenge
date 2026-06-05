@@ -301,6 +301,7 @@ def train(
             _tensor(elapsed_tr).unsqueeze(1),
             _tensor(late_weight_tr).unsqueeze(1),
             torch.tensor(stage_tr, dtype=torch.long),
+            _tensor(case_max_tr).unsqueeze(1)
         )
         if balanced:
             w = _balanced_weights(
@@ -317,7 +318,8 @@ def train(
                           _tensor(hi_va).unsqueeze(1),
                           case_int_va,
                           _tensor(elapsed_va).unsqueeze(1),
-                          torch.tensor(stage_va, dtype=torch.long)),
+                          torch.tensor(stage_va, dtype=torch.long),
+                          _tensor(case_max_va).unsqueeze(1)),
             batch_size=batch_size, shuffle=False,
         )
 
@@ -327,7 +329,7 @@ def train(
             vibration_features=X_vib.shape[3],
             handcrafted_dim=X_feat.shape[-1],
         ).to(device)
-        criterion = TrainingLoss(lambda1=0.1, lambda2=0.01)
+        criterion = TrainingLoss(lambda1=0.1)
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=WEIGHT_DECAY)
         
         warmup_epochs = max(1, epochs // 5)
@@ -350,62 +352,54 @@ def train(
         for epoch in range(1, epochs + 1):
             model.train()
             tr_hi = tr_hi_rank = tr_mono = tr_smooth = tr_stage = tr_tot = 0.0
-            for bv, bf, by_hi, by_case, by_elapsed, by_weight, by_stage in train_loader:
+            for bv, bf, by_hi, by_case, by_elapsed, by_weight, by_stage, by_lifetime in train_loader:
                 bv, bf = bv.to(device), bf.to(device)
                 by_hi = by_hi.to(device)
                 by_case = by_case.to(device)
                 by_elapsed = by_elapsed.to(device)
                 by_weight = by_weight.to(device)
-                by_stage = by_stage.to(device)
 
                 optimizer.zero_grad()
-                pred_hi, stage_logits = model(bv, bf, by_elapsed, return_stage=True)
-                loss, l_hi, l_hi_rank, l_mono, l_smooth, l_stage = criterion(
-                    pred_hi, by_hi, by_case, by_elapsed, by_weight,
-                    stage_logits=stage_logits, stage_labels=by_stage,
+                pred_hi = model(bv, bf, by_elapsed)
+                loss, l_hi, l_mono = criterion(
+                    pred_hi, by_hi,
+                    case_ids=by_case, elapsed=by_elapsed,
+                    late_weights=by_weight
                 )
-
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
                 n = by_hi.size(0)
                 tr_hi      += l_hi.item()      * n
-                tr_hi_rank += l_hi_rank.item() * n
                 tr_mono    += l_mono.item()    * n
-                tr_smooth  += l_smooth.item()  * n
-                tr_stage   += l_stage.item()   * n
                 tr_tot     += loss.item()      * n
 
             model.eval()
-            va_hi = va_hi_rank = va_mono = va_smooth = va_stage = va_tot = 0.0
+            va_hi = va_mono = va_tot = 0.0
             _ep_hi = []
             with torch.no_grad():
-                for bv, bf, by_hi, by_case, by_elapsed, by_stage in val_loader:
+                for bv, bf, by_hi, by_case, by_elapsed, by_stage, by_lifetime in val_loader:
                     bv, bf = bv.to(device), bf.to(device)
                     by_hi = by_hi.to(device)
                     by_case = by_case.to(device)
                     by_elapsed = by_elapsed.to(device)
-                    by_stage = by_stage.to(device)
 
-                    pred_hi_b, stage_logits_b = model(bv, bf, by_elapsed, return_stage=True)
-                    loss, l_hi, l_hi_rank, l_mono, l_smooth, l_stage = criterion(
-                        pred_hi_b, by_hi, by_case, by_elapsed, None,
-                        stage_logits=stage_logits_b, stage_labels=by_stage,
+                    pred_hi_b = model(bv, bf, by_elapsed)
+                    loss, l_hi, l_mono = criterion(
+                        pred_hi_b, by_hi,
+                        case_ids=by_case, elapsed=by_elapsed
                     )
 
                     n = by_hi.size(0)
                     va_hi      += l_hi.item()      * n
-                    va_hi_rank += l_hi_rank.item() * n
                     va_mono    += l_mono.item()    * n
-                    va_smooth  += l_smooth.item()  * n
-                    va_stage   += l_stage.item()   * n
                     va_tot     += loss.item()      * n
                     _ep_hi.append(np.array(pred_hi_b.squeeze(1).cpu().tolist(), dtype=np.float32))
 
             n_tr, n_va = len(train_loader.dataset), len(val_loader.dataset)
-            tr_hi /= n_tr; tr_hi_rank /= n_tr; tr_mono /= n_tr; tr_smooth /= n_tr; tr_stage /= n_tr; tr_tot /= n_tr
-            va_hi /= n_va; va_hi_rank /= n_va; va_mono /= n_va; va_smooth /= n_va; va_stage /= n_va; va_tot /= n_va
+            tr_hi /= n_tr; tr_mono /= n_tr; tr_tot /= n_tr
+            va_hi /= n_va; va_mono /= n_va; va_tot /= n_va
             scheduler.step()
 
             ep_pred_hi  = np.concatenate(_ep_hi).astype(np.float64)
@@ -448,9 +442,11 @@ def train(
                 recent_scores.pop(0)
             smoothed_score = float(np.mean(recent_scores))
 
+            is_best = False
             if smoothed_score > best_val_score:
                 best_val_score = smoothed_score
                 best_epoch = epoch
+                is_best = True
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 patience = 0
                 _make_trajectory_plot(ep_true_rul, s2_rul, ep_true_hi, ep_pred_hi, val_times_sec, "best", plot_dir)
@@ -464,8 +460,8 @@ def train(
             if epoch in PLOT_EPOCHS:
                 _make_trajectory_plot(ep_true_rul, s2_rul, ep_true_hi, ep_pred_hi, val_times_sec, str(epoch).zfill(2), plot_dir)
 
-            if epoch % 5 == 0 or epoch == 1:
-                print(f"  epoch {epoch:03d}/{epochs} | va(tot={va_tot:.4f} hi={va_hi:.4f} mono={va_mono:.4f} sm={va_smooth:.4f})")
+            if epoch == 1 or epoch % 5 == 0 or is_best:
+                print(f"  epoch {epoch:03d}/{epochs} | va(tot={va_tot:.4f} hi={va_hi:.4f} mono={va_mono:.4f})")
                 print(f"    -> Metric: HI_MAE={hi_mae:.3f} | NegDiffs={neg_diffs:.0f} | RUL_Std={rul_stability:.0f} | FitRatio={fit_success_ratio:.2f} | Score={score:.3f}")
 
         if best_state is not None:
@@ -480,7 +476,7 @@ def train(
         model.eval()
         hi_preds = []
         with torch.no_grad():
-            for bv, bf, _, _, be, _ in val_loader:
+            for bv, bf, _, _, be, _, _ in val_loader:
                 ph = model(bv.to(device), bf.to(device), be.to(device))
                 hi_preds.append(np.array(ph.squeeze(1).cpu().tolist(), dtype=np.float32))
         hi_preds = np.concatenate(hi_preds).astype(np.float64)

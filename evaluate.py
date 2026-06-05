@@ -54,23 +54,23 @@ def _load_fold(ckpt_path: Path, device: torch.device):
 
 
 def _predict(model: torch.nn.Module, X_vib: np.ndarray, X_feat: np.ndarray,
-             device: torch.device, batch_size: int = 16,
-             elapsed_frac: Optional[np.ndarray] = None) -> np.ndarray:
-    hi = []
-    n = len(X_vib)
+             device: torch.device, elapsed_frac: np.ndarray | None = None) -> np.ndarray:
+    model.eval()
+    bs = 16
+    preds_hi = []
+    
     with torch.no_grad():
-        for start in range(0, n, batch_size):
-            end = min(start + batch_size, n)
-            vb = torch.from_numpy(np.ascontiguousarray(X_vib[start:end])).to(device)
-            fb = torch.from_numpy(np.ascontiguousarray(X_feat[start:end])).to(device)
-            ef = None
-            if elapsed_frac is not None:
-                ef = torch.tensor(
-                    elapsed_frac[start:end].reshape(-1, 1), dtype=torch.float32
-                ).to(device)
+        for i in range(0, len(X_vib), bs):
+            vb = torch.tensor(X_vib[i:i+bs], dtype=torch.float32, device=device)
+            fb = torch.tensor(X_feat[i:i+bs], dtype=torch.float32, device=device)
+            ef = torch.tensor(elapsed_frac[i:i+bs], dtype=torch.float32, device=device).unsqueeze(1) if elapsed_frac is not None else None
+            
             ph = model(vb, fb, ef)
-            hi.append(np.array(ph.squeeze(1).cpu().tolist(), dtype=np.float32))
-    return np.concatenate(hi, axis=0)
+            
+            preds_hi.append(ph.cpu().numpy())
+            
+    hi = np.concatenate(preds_hi, axis=0).squeeze()
+    return hi
 
 
 def evaluate_test(
@@ -115,8 +115,8 @@ def evaluate_test(
     X_vib = X_vib_raw
     X_feat = X_feat_raw
 
-    fold_hi: list[np.ndarray] = []
-    lifetime_priors: list[dict] = []   # fold 별 lognormal prior — Stage 2 MRL fallback 용
+    fold_hi = []
+    lifetime_priors = []
     for fp in fold_paths:
         model, _ckpt = _load_fold(fp, device)
         hi = _predict(model, X_vib, X_feat, device, elapsed_frac=elapsed_frac)

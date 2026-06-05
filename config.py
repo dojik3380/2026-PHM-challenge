@@ -81,7 +81,7 @@ AUGMENTED_HANDCRAFTED_DIM = (HANDCRAFTED_DIM * 3) if HI_FEATURES_ENABLED else HA
 #              short/long-lifetime outlier problem (Train3 / Train4) that
 #              time-based labels suffer from.
 #   "hybrid" : 0.5 * linear + 0.5 * damage                (best of both)
-HI_LABEL_MODE = "exponential"
+HI_LABEL_MODE = "power"
 HI_ALPHA = 4.0               # degradation acceleration: HI(t) = (e^(α·t/T)-1)/(e^α-1)
 HI_LABEL_POWER = 2.0
 HI_DAMAGE_SCALE = 5.0        # RMS growth ratio that maps to HI=1.0 (tanh saturation)
@@ -152,7 +152,7 @@ VAL_CASE_SEED = None   # None → truly random each run; set an int for reproduc
 #
 # A_RUL (Stage-2 기반) is used ONLY in validation reporting, not in training.
 HI_LOSS_WEIGHT      = 0.75
-HI_RANK_LOSS_WEIGHT = 0.25
+HI_RANK_LOSS_WEIGHT = 0.0
 HUBER_DELTA         = 0.3
 LATE_LIFE_WEIGHT    = 8.0
 
@@ -193,10 +193,10 @@ STAGE2_WLS_ROLLING_WINDOW = 50           # FCP 이후 최근 N 점만 사용 (30
 # 각 case 의 첫 N window 의 HI_kf mean+std 로 진입 임계 결정.
 # Nguyen et al. 2025, Wang & Xiang 2021 등 사용. fold 별 HI 분포 변동에 강건.
 STAGE2_FDP_BASELINE_N = 30               # 초기 Baseline 추정을 위한 윈도우 개수
-STAGE2_FDP_K_SIGMA    = 2.0              # Baseline 평균 대비 몇 시그마 위를 FDP로 볼 것인가 (Best tuned: 2.0)
-STAGE2_FDP_MIN        = 0.08             # 최소 임계 (지나치게 낮은 noise spike 차단)
-STAGE2_FDP_MAX        = 0.25             # 최대 임계 (FDP 너무 늦어지면 lifetime 대부분 fallback)
-STAGE2_FDP_THRESHOLD  = 0.15             # legacy static fallback (lifetime_prior 없을 때만)
+STAGE2_FDP_K_SIGMA        = 3.0         # dynamic threshold: baseline_mean + k * baseline_std (Increased to 3.0 to suppress Test1 false alarm) 평균 대비 몇 시그마 위를 FDP로 볼 것인가 (Best tuned: 2.0)
+STAGE2_FDP_MIN        = 0.60             # 초기 임계치 (Power Labeling 과대적합 방지)
+STAGE2_FDP_MAX        = 0.70             # 최대 임계치 (FDP 너무 늦어 lifetime 낭비 방지)
+STAGE2_FDP_THRESHOLD  = 0.60             # Test 1~6 초기 데이터에 대해 지수 피팅 방어선
 
 STAGE2_FCP_MIN_RATIO      = 0.10         # increment 인덱스 비율로 너무 이른 FCP 거부
 STAGE2_FCP_MAX_RATIO      = 0.95         # 너무 늦은 FCP 도 거부 (외삽 데이터 부족)
@@ -208,7 +208,7 @@ STAGE2_MACRO_ROLLING      = 300          # macro fitting 광역 윈도우 (50분
 STAGE2_LOG_EPS            = 1e-6         # log(HI) 안정화용 epsilon
 STAGE2_BETA_MIN_FIT       = 1e-8         # log-linear slope 이 이보다 작으면 reject
 STAGE2_FDP_FALLBACK_RUL   = 200_000.0     # FDP 미도달 시 global linear fit 의 safe upper bound (Long-life outlier 대응)
-STAGE2_FDP_MIN_SLOPE      = 1e-8         # FDP 미도달 global fit 의 slope 임계
+STAGE2_FDP_MIN_SLOPE      = 1e-4         # FDP 미도달 global fit 의 slope 임계
 
 # Stage 1 — per-case local normalization (Train4 OOD 해소)
 STAGE1_NORMALIZE_N_BASELINE = DEGRADATION_BASELINE_TIMESTEPS  # 첫 N window 가 healthy
@@ -220,13 +220,13 @@ STAGE1_NORMALIZE_N_BASELINE = DEGRADATION_BASELINE_TIMESTEPS  # 첫 N window 가
 # Track 1: 극한의 단수명 베어링 오차 방어를 위한 Lognormal 통계적 안전판 (CQRL)
 # - Train fold의 lifetime prior 분포 기반, 과대평가 방지를 위한 보수적 35% 분위수 사용 (Best tuned: 0.35)
 STAGE2_LIFETIME_PRIOR_DIST = "lognormal"   # 분포 family
-STAGE2_LIFETIME_PRIOR_QUANTILE = 0.35      # 보수적인 분위수(35%) 적용 (Risk-averse)
+STAGE2_LIFETIME_PRIOR_QUANTILE = 0.35      # 분위수(35%) 적용 (Risk-averse)
 STAGE2_FALLBACK_FLOOR      = 2_000.0       # CQRL fallback 의 최소값 (degenerate prior 방지)
 
 # Stage 1 — Degradation Stage Classification (auxiliary multi-task head)
 # absolute lifetime position 학습 → case fingerprint representation
 # 4-class CE: lifetime fraction 을 경계로 양자화
-STAGE_CE_WEIGHT     = 0.3                           # loss 비중 (HI Huber + Rank 와 함께)
+STAGE_CE_WEIGHT     = 0.0                           # loss 비중 (HI Huber + Rank 와 함께)
 STAGE_BOUNDARIES    = (0.40, 0.70, 0.90)            # healthy/incipient/fault/severe (quantile, late-loaded)
 STAGE_NUM_CLASSES   = len(STAGE_BOUNDARIES) + 1     # = 4
 

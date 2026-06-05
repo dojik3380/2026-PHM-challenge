@@ -117,21 +117,13 @@ class TrainingLoss(nn.Module):
 
     def __init__(
         self,
-        hi_weight:      float = HI_LOSS_WEIGHT,
-        hi_rank_weight: float = HI_RANK_LOSS_WEIGHT,
+        hi_weight:      float = 1.0,
         lambda1:        float = 0.5,
-        lambda2:        float = 0.1,
-        stage_weight:   float = STAGE_CE_WEIGHT,
     ):
         super().__init__()
-        self.hi_loss      = nn.HuberLoss(delta=HUBER_DELTA, reduction="none")
-        self.hi_ranking   = HIPairwiseRankingLoss()
-        self.stage_ce     = nn.CrossEntropyLoss()
+        self.hi_loss      = nn.MSELoss(reduction="none")
         self.hi_weight      = hi_weight
-        self.hi_rank_weight = hi_rank_weight
         self.lambda1        = lambda1
-        self.lambda2        = lambda2
-        self.stage_weight   = stage_weight
 
     def forward(
         self,
@@ -140,23 +132,23 @@ class TrainingLoss(nn.Module):
         case_ids:     Optional[torch.Tensor] = None,
         elapsed:      Optional[torch.Tensor] = None,
         late_weights: Optional[torch.Tensor] = None,
-        stage_logits: Optional[torch.Tensor] = None,
-        stage_labels: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         p_hi = pred_hi.view(-1)
         t_hi = target_hi.view(-1)
 
+        # Exponential Late-stage weighting: target_hi가 클수록 가중치 급증
+        late_stage_w = torch.exp(3.0 * t_hi)
+        
         if late_weights is not None:
-            w = late_weights.view(-1)
+            w = late_weights.view(-1) * late_stage_w
             w = w / (w.mean() + 1e-9)
             l_hi = (self.hi_loss(p_hi, t_hi) * w).mean()
         else:
-            l_hi = self.hi_loss(p_hi, t_hi).mean()
-
-        l_hi_rank = self.hi_ranking(pred_hi, target_hi, case_ids)
+            w = late_stage_w
+            w = w / (w.mean() + 1e-9)
+            l_hi = (self.hi_loss(p_hi, t_hi) * w).mean()
 
         l_mono = torch.tensor(0.0, device=pred_hi.device)
-        l_smooth = torch.tensor(0.0, device=pred_hi.device)
 
         if case_ids is not None and elapsed is not None:
             c_ids = case_ids.view(-1)
@@ -175,22 +167,13 @@ class TrainingLoss(nn.Module):
                 p_next = p_sorted[1:][same_case_mask]
 
                 l_mono = torch.relu(p_prev - p_next).mean()
-                l_smooth = torch.abs(p_next - p_prev).mean()
-
-        # Stage classification CE — case fingerprint / absolute lifetime position
-        if stage_logits is not None and stage_labels is not None:
-            l_stage = self.stage_ce(stage_logits, stage_labels.view(-1).long())
-        else:
-            l_stage = torch.tensor(0.0, device=pred_hi.device)
 
         total = (
             self.hi_weight * l_hi
-            + self.hi_rank_weight * l_hi_rank
             + self.lambda1 * l_mono
-            + self.lambda2 * l_smooth
-            + self.stage_weight * l_stage
         )
-        return total, l_hi, l_hi_rank, l_mono, l_smooth, l_stage
+
+        return total, l_hi, l_mono
 
 
 def asymmetric_rul_score_np(predictions, targets) -> np.ndarray:
@@ -287,15 +270,13 @@ class HIModel(nn.Module):
         # Stage classification auxiliary head: lifetime quantile 4-class
         # (healthy / incipient / fault / severe) → case fingerprint representation
         # 학계 표준 multi-task: contrastive 대안. 절대 lifetime 위치 학습.
-        self.stage_head = nn.Linear(96, STAGE_NUM_CLASSES)
+        # First Principles Diet: Removed stage_head and lifetime_head
 
     def forward(self, x_vib: torch.Tensor, x_feat: torch.Tensor,
-                elapsed_frac: Optional[torch.Tensor] = None,
-                return_stage: bool = False):
-        """Return hi_pred ∈ [0, 1]. return_stage=True 면 (hi, stage_logits) tuple.
+                elapsed_frac: Optional[torch.Tensor] = None):
+        """Return hi_pred ∈ [0, 1].
 
         elapsed_frac = time_sec / case_max ∈ [0, 1].
-        backward compat: 기본 return_stage=False → 기존 호출자 (HI 만) 그대로.
         """
         b, seq, ch, fbin = x_vib.shape
 
@@ -319,9 +300,6 @@ class HIModel(nn.Module):
 
         h = self.fusion(torch.cat([h_vib, h_feat, h_elapsed], dim=1))
         hi = self.hi_head(h)
-        if return_stage:
-            stage_logits = self.stage_head(h)
-            return hi, stage_logits
         return hi
 
 

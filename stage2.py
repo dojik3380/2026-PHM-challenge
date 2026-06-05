@@ -38,6 +38,8 @@ from config import (
     STAGE2_FDP_MAX,
     STAGE2_FALLBACK_FLOOR,
     STAGE2_LIFETIME_PRIOR_QUANTILE,
+    STAGE2_FDP_MIN_SLOPE,
+    HI_ALPHA,
 )
 
 # ---------------------------------------------------------------------------
@@ -153,19 +155,53 @@ def lognormal_cqrl(t_now: float, mu: float, sigma: float, quantile: float = STAG
 
 
 def _fallback_rul(t_now: float, lifetime_prior: dict | None, cqrl_quantile: float | None = None) -> float:
-    """Track 1 의 FDP 미통과 fallback. lifetime_prior 있으면 CQRL, 없으면 legacy 60000."""
+    """Track 1: 통계적 확률 분포(Prior)에 기반한 RUL 캡 계산 (CQRL)."""
     q = cqrl_quantile if cqrl_quantile is not None else STAGE2_LIFETIME_PRIOR_QUANTILE
     if lifetime_prior is not None:
         mu = float(lifetime_prior["mu"])
         sigma = float(lifetime_prior["sigma"])
         return lognormal_cqrl(t_now, mu, sigma, q)
     # Legacy: static cap (인위적, 사용자 지적)
-    return 60_000.0
+    return max(STAGE2_FALLBACK_RUL_CAP - t_now, STAGE2_FALLBACK_FLOOR)
 
 
 # ---------------------------------------------------------------------------
 # 2) Curve Fitting
 # ---------------------------------------------------------------------------
+
+def _fit_exact_exponential_rul(
+    times: np.ndarray,
+    hi_filtered: np.ndarray,
+    t_now: float,
+    fallback_rul_cap: float,
+) -> float:
+    n = len(times)
+    if n < 3:
+        return fallback_rul_cap
+
+    rolling = min(300, n)
+    t_window = times[-rolling:]
+    hi_window = hi_filtered[-rolling:]
+    hi_window = np.maximum.accumulate(hi_window)
+    
+    # We want to fit T_life in: HI(t) = (t / T_life) ** HI_LABEL_POWER
+    # So sqrt(HI) = t / T_life (assuming POWER = 2.0)
+    # T_life = t / sqrt(HI)
+    from config import HI_LABEL_POWER
+    power = float(HI_LABEL_POWER)
+    
+    def power_func(t, T_life):
+        # Prevent negative values in power function
+        return np.power(np.maximum(t / T_life, 0.0), power)
+        
+    try:
+        popt, _ = curve_fit(power_func, t_window, hi_window, p0=[max(t_now, 10000.0)], bounds=([t_now], [np.inf]))
+        T_life = popt[0]
+        rul = float(max(T_life - t_now, 0.0))
+        return min(rul, fallback_rul_cap)
+    except:
+        return fallback_rul_cap
+
 def _fit_log_linear_rul(
     times: np.ndarray,
     hi_filtered: np.ndarray,
@@ -258,31 +294,32 @@ def fit_stage2_rul(
     t_now = float(t[-1])
     fdp_thresh = dynamic_fdp_threshold(hi_f, k_sigma=fdp_k_sigma if fdp_k_sigma is not None else STAGE2_FDP_K_SIGMA)
 
-    if hi_f[-1] <= fdp_thresh:
-        # Track 1: FDP 미통과. Global Linear Fit + lifetime_prior MRL fallback
+    # -----------------------------------------------------------------------
+    # First Principles: Analytic Power Law Extrapolation
+    # Since our Neural Network is trained on a strict HI = (t / T)^2 target,
+    # the exact physical interpretation of the predicted HI is T = t / sqrt(HI).
+    # Therefore, RUL = T - t = t * (1 / sqrt(HI) - 1).
+    # -----------------------------------------------------------------------
+    hi_now = hi_f[-1]
+    
+    if hi_now > 0.01:
+        power_rul = t_now * (1.0 / np.sqrt(hi_now) - 1.0)
+    else:
+        power_rul = _fallback_rul(t_now, lifetime_prior, cqrl_quantile)
+        
+    if hi_now <= fdp_thresh:
+        # Track 1: Early Stage. Blend Prior Cap with Power RUL
+        # The smaller the HI, the more we trust the Prior (noise dominates small HI)
         cap = _fallback_rul(t_now, lifetime_prior, cqrl_quantile)
-        t_mean = np.mean(t)
-        hi_mean = np.mean(hi_kf)
-        t_centered = t - t_mean
-        hi_centered = hi_kf - hi_mean
+        alpha = np.exp(-5.0 * hi_now)  # hi=0 -> 1.0 (Prior), hi=0.6 -> 0.05 (Power RUL)
+        rul = alpha * cap + (1.0 - alpha) * power_rul
+        return float(min(max(rul, 0.0), cap))
 
-        sum_t2_centered = np.sum(t_centered ** 2)
-        if sum_t2_centered < 1e-6:
-            return cap
-
-        slope = np.sum(t_centered * hi_centered) / sum_t2_centered
-        if slope < 1e-8:
-            rul = cap
-        else:
-            intercept = hi_mean - slope * t_mean
-            t_fail = (HI_FAILURE_THRESHOLD - intercept) / slope
-            rul = max(t_fail - t_now, 0.0)
-            rul = min(rul, cap)   # lifetime-prior MRL 로 cap
-
-        return float(rul)
-
-    rul = _fit_log_linear_rul(t, hi_kf, t_now, failure_threshold, fallback_rul_cap)
-    return rul
+    # Track 2: Late Stage. Blend Exponential Extrapolation with Power RUL
+    rul_exp = _fit_exact_exponential_rul(t, hi_kf, t_now, fallback_rul_cap)
+    
+    rul = 0.5 * rul_exp + 0.5 * power_rul
+    return float(max(rul, 0.0))
 
 
 def compute_stage2_trajectory(
@@ -340,7 +377,7 @@ def compute_stage2_trajectory(
                 rul = cap
             else:
                 slope = np.sum(t_centered * hi_centered) / sum_t2_centered
-                if slope < 1e-8:
+                if slope < STAGE2_FDP_MIN_SLOPE:
                     rul = cap
                 else:
                     intercept = hi_mean - slope * t_mean
